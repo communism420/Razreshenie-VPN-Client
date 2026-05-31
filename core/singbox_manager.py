@@ -17,11 +17,14 @@
 
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import logging
+import os
 import shutil
 import subprocess
 import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -49,7 +52,16 @@ class SingBoxManager:
         self.process: subprocess.Popen[str] | None = None
         self.config_path = paths.runtime_config_path()
         self._lock = threading.RLock()
+        self._output_lock = threading.RLock()
         self._reader_thread: threading.Thread | None = None
+        self._last_output_lines: deque[str] = deque(maxlen=40)
+        self._active_tun_interface: str | None = None
+
+    @staticmethod
+    def _no_window_kwargs() -> dict[str, object]:
+        if os.name != "nt":
+            return {}
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
     @property
     def executable_path(self) -> Path | None:
@@ -116,6 +128,10 @@ class SingBoxManager:
         exe = self.executable_path
         if not exe:
             return "не установлен"
+        metadata = read_json(paths.ensure_app_dirs()["cores"] / "sing-box.json", {})
+        cached_version = str(metadata.get("version") or "").strip()
+        if cached_version:
+            return f"sing-box {cached_version}"
         try:
             proc = subprocess.run(
                 [str(exe), "version"],
@@ -125,6 +141,7 @@ class SingBoxManager:
                 errors="replace",
                 timeout=8,
                 check=False,
+                **self._no_window_kwargs(),
             )
             return (proc.stdout or proc.stderr).strip().splitlines()[0]
         except (OSError, subprocess.SubprocessError):
@@ -155,6 +172,7 @@ class SingBoxManager:
                 errors="replace",
                 timeout=20,
                 check=False,
+                **self._no_window_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return False, str(exc)
@@ -170,35 +188,84 @@ class SingBoxManager:
             ok, output = self.check_config(config_path)
             if not ok:
                 raise SingBoxError(f"sing-box отклонил конфигурацию:\n{output}")
-            self.logger.info("Запуск sing-box: %s", config_path)
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            self.process = subprocess.Popen(
-                [str(exe), "run", "-c", str(config_path)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=creationflags,
-            )
-            self._reader_thread = threading.Thread(target=self._read_process_logs, daemon=True)
-            self._reader_thread.start()
+            if settings.mode == "tun":
+                conflicts = self._active_foreign_tun_adapters(settings.tun_interface_name)
+                if conflicts:
+                    names = ", ".join(conflicts[:3])
+                    raise SingBoxError(
+                        "Обнаружен активный TUN другого VPN: "
+                        f"{names}. Закройте Karing или другой VPN-клиент и подключитесь заново, "
+                        "иначе Windows будет использовать чужой DNS, а раздельное туннелирование не сработает."
+                    )
+            self._kill_orphaned(exe)
+            if settings.mode == "tun":
+                self._clear_runtime_cache(exe)
+                self._flush_windows_dns_cache()
+
+            attempts = 3 if settings.mode == "tun" else 1
+            last_error = ""
+            for attempt in range(1, attempts + 1):
+                self._clear_last_output()
+                self.logger.info("Запуск sing-box: %s (попытка %s/%s)", config_path, attempt, attempts)
+                self._active_tun_interface = settings.tun_interface_name if settings.mode == "tun" else None
+                self.process = subprocess.Popen(
+                    [str(exe), "run", "-c", str(config_path), "-D", str(exe.parent)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    cwd=str(exe.parent),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    **self._no_window_kwargs(),
+                )
+                self._reader_thread = threading.Thread(target=self._read_process_logs, daemon=True)
+                self._reader_thread.start()
+
+                if settings.mode != "tun":
+                    self._wait_for_proxy_startup()
+                    if self.is_running():
+                        return
+                    raise SingBoxError(self._unexpected_exit_message(startup=True))
+
+                if self._wait_until_tun_ready(settings.tun_interface_name):
+                    return
+
+                exited = self.process is None or self.process.poll() is not None
+                last_error = self._unexpected_exit_message(startup=True) if exited else (
+                    f"sing-box запустился, но TUN-интерфейс '{settings.tun_interface_name}' не получил IPv4-адрес"
+                )
+                retryable = exited and self._startup_error_is_retryable()
+                self._stop_process_locked(wait_tun_release=True, tun_interface_name=settings.tun_interface_name)
+                if retryable and attempt < attempts:
+                    self._wait_tun_released(settings.tun_interface_name)
+                    continue
+                break
+
+            raise SingBoxError(last_error or "Не удалось запустить sing-box")
 
     def stop(self) -> None:
         with self._lock:
-            if not self.process:
-                return
-            proc = self.process
-            if proc.poll() is None:
-                self.logger.info("Остановка sing-box")
-                proc.terminate()
-                try:
-                    proc.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    self.logger.warning("sing-box не завершился штатно, выполняется kill")
-                    proc.kill()
-                    proc.wait(timeout=5)
-            self.process = None
+            self._stop_process_locked(wait_tun_release=True)
+
+    def _stop_process_locked(self, wait_tun_release: bool = False, tun_interface_name: str | None = None) -> None:
+        if not self.process:
+            return
+        proc = self.process
+        interface_name = tun_interface_name or self._active_tun_interface
+        if proc.poll() is None:
+            self.logger.info("Остановка sing-box")
+            proc.terminate()
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                self.logger.warning("sing-box не завершился штатно, выполняется kill")
+                proc.kill()
+                proc.wait(timeout=5)
+        self.process = None
+        self._active_tun_interface = None
+        if wait_tun_release:
+            self._wait_tun_released(interface_name)
+            self._flush_windows_dns_cache()
 
     def _read_process_logs(self) -> None:
         proc = self.process
@@ -207,10 +274,183 @@ class SingBoxManager:
         for line in proc.stdout:
             message = line.strip()
             if message:
+                with self._output_lock:
+                    self._last_output_lines.append(message)
                 self.logger.info("[sing-box] %s", message)
         code = proc.poll()
         if code not in (None, 0):
             self.logger.error("sing-box завершился с кодом %s", code)
+
+    def _clear_last_output(self) -> None:
+        with self._output_lock:
+            self._last_output_lines.clear()
+
+    def _last_output(self) -> list[str]:
+        with self._output_lock:
+            return list(self._last_output_lines)
+
+    def _wait_for_proxy_startup(self, max_wait: float = 1.2) -> None:
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
+            if not self.process or self.process.poll() is not None:
+                return
+            time.sleep(0.05)
+
+    def _wait_until_tun_ready(self, tun_interface_name: str, max_wait: float = 18.0) -> bool:
+        if os.name != "nt" or not tun_interface_name:
+            return self.is_running()
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
+            if not self.process or self.process.poll() is not None:
+                return False
+            if self._tun_interface_has_ipv4(tun_interface_name):
+                return True
+            time.sleep(0.25)
+        return False
+
+    @staticmethod
+    def _tun_interface_has_ipv4(tun_interface_name: str) -> bool:
+        escaped_name = tun_interface_name.replace("'", "''")
+        script = (
+            f"$ipv4 = Get-NetIPAddress -InterfaceAlias '{escaped_name}' -AddressFamily IPv4 -ErrorAction SilentlyContinue "
+            "| Where-Object { $_.IPAddress -and $_.IPAddress -ne '0.0.0.0' } "
+            "| Select-Object -First 1 IPAddress; "
+            "if ($ipv4) { exit 0 } else { exit 1 }"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=4,
+                check=False,
+                **SingBoxManager._no_window_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    def _wait_tun_released(self, tun_interface_name: str | None = None, max_wait: float = 10.0) -> None:
+        if os.name != "nt":
+            return
+        name = str(tun_interface_name or "").strip()
+        if not name:
+            return
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
+            if not self._tun_interface_has_ipv4(name):
+                return
+            time.sleep(0.3)
+
+    def _flush_windows_dns_cache(self) -> None:
+        if os.name != "nt":
+            return
+        commands = [
+            ["ipconfig", "/flushdns"],
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Clear-DnsClientCache"],
+        ]
+        for command in commands:
+            try:
+                subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=5,
+                    check=False,
+                    **self._no_window_kwargs(),
+                )
+            except (OSError, subprocess.SubprocessError):
+                self.logger.debug("Не удалось очистить DNS-кэш Windows командой %s", command[0], exc_info=True)
+
+    def _clear_runtime_cache(self, exe: Path) -> None:
+        for name in ("cache.db", "cache.db-shm", "cache.db-wal"):
+            try:
+                (exe.parent / name).unlink(missing_ok=True)
+            except OSError:
+                self.logger.debug("Не удалось удалить runtime-cache sing-box: %s", exe.parent / name, exc_info=True)
+
+    def _active_foreign_tun_adapters(self, own_interface_name: str) -> list[str]:
+        if os.name != "nt":
+            return []
+        own = str(own_interface_name or "").replace("'", "''")
+        script = (
+            "$ErrorActionPreference='SilentlyContinue'; "
+            f"$own='{own}'; "
+            "Get-NetAdapter | "
+            "Where-Object { "
+            "$_.Status -eq 'Up' -and $_.Name -ne $own -and "
+            "($_.Name -match '(?i)(tun|wintun|wireguard|karing)' -or "
+            "$_.InterfaceDescription -match '(?i)(tun|wintun|wireguard|tunnel|karing)') "
+            "} | ForEach-Object { $_.Name }"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=6,
+                check=False,
+                **self._no_window_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def _kill_orphaned(self, exe: Path) -> None:
+        if os.name != "nt":
+            return
+        target = str(exe.resolve()).replace("'", "''")
+        script = (
+            "$ErrorActionPreference='SilentlyContinue'; "
+            f"$target='{target}'; "
+            "Get-CimInstance Win32_Process -Filter \"Name = 'sing-box.exe'\" | "
+            "Where-Object { $_.ExecutablePath -eq $target } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=6,
+                check=False,
+                **self._no_window_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return
+        if result.returncode == 0:
+            time.sleep(0.8)
+
+    def _startup_error_is_retryable(self) -> bool:
+        needles = (
+            "already exists",
+            "cannot create a file when that file already exists",
+            "adapter already exists",
+        )
+        for line in self._last_output():
+            text = line.lower()
+            if any(needle in text for needle in needles):
+                return True
+        return False
+
+    def _unexpected_exit_message(self, startup: bool) -> str:
+        stage = "при запуске" if startup else "во время работы"
+        lines = self._last_output()
+        if lines:
+            return f"sing-box завершился {stage}: {lines[-1]}"
+        if self.process and self.process.returncode is not None:
+            return f"sing-box завершился {stage} с кодом {self.process.returncode}"
+        return f"sing-box завершился {stage}"
 
     def _select_windows_asset(self, assets: list[dict[str, Any]]) -> dict[str, Any] | None:
         for asset in assets:

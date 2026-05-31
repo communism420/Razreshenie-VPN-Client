@@ -83,7 +83,14 @@ from core.singbox_manager import SingBoxError, SingBoxManager
 from core.subscription_manager import SubscriptionError, SubscriptionManager
 from core.vless_parser import VlessParseError, parse_vless_uri
 from models.profile import Subscription, VlessProfile, utc_now_iso
-from models.rules import ROUTE_OUTBOUND_DIRECT, ROUTE_OUTBOUND_PROXY, RoutingRuleSet, SplitRules, normalize_outbound
+from models.rules import (
+    BUILTIN_DIRECT_DOMAIN_SUFFIXES,
+    ROUTE_OUTBOUND_DIRECT,
+    ROUTE_OUTBOUND_PROXY,
+    RoutingRuleSet,
+    SplitRules,
+    normalize_outbound,
+)
 from models.settings import AppSettings
 from utils import paths, windows
 from utils.app_logger import LogBuffer, setup_logger
@@ -93,15 +100,22 @@ from utils.network import (
     format_speed,
     get_public_ip,
     measure_server_latency_ms,
-    ping_host,
 )
 from utils.scheduler import RepeatingTask
-from utils.version import APP_NAME, APP_REPOSITORY, APP_VERSION, ZAPRET_KVN_REPOSITORY
+from utils.version import (
+    APP_NAME,
+    APP_REPOSITORY,
+    APP_VERSION,
+    RUSSIA_MOBILE_WHITELIST_REPOSITORY,
+    ZAPRET_KVN_REPOSITORY,
+)
 
 
 ACCENT = "#0078D4"
 DANGER = "#D83B01"
 SUCCESS = "#16C60C"
+LATENCY_SCAN_TIMEOUT_MS = 1200
+LATENCY_SCAN_WORKERS = 6
 
 
 def app_logo_icon() -> QIcon:
@@ -517,6 +531,7 @@ class ServersPage(QWidget):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setDefaultSectionSize(34)
         for col in (2, 3, 4, 5):
             self.table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         root.addWidget(self.table, 1)
@@ -545,6 +560,7 @@ class ServersPage(QWidget):
         return None
 
     def reload(self) -> None:
+        selected_id = self.selected_id()
         query = self.search.text().strip().lower()
         items = [
             profile
@@ -561,23 +577,31 @@ class ServersPage(QWidget):
             items.sort(key=lambda item: (item.latency_ms is None, item.latency_ms or 10**9, item.name.lower()))
 
         self._visible_ids = [item.id for item in items]
-        self.table.setRowCount(len(items))
-        for row, profile in enumerate(items):
-            values = [
-                profile.name,
-                profile.address,
-                str(profile.port),
-                profile.protocol.upper(),
-                self._latency_label(profile),
-                "Да" if profile.id == getattr(self, "_active_id", None) else "",
-            ]
-            for col, value in enumerate(values):
-                table_item = QTableWidgetItem(value)
-                table_item.setData(Qt.ItemDataRole.UserRole, profile.id)
-                if profile.id == getattr(self, "_active_id", None):
-                    table_item.setForeground(QColor(0, 120, 212))
-                self.table.setItem(row, col, table_item)
-        self.table.resizeRowsToContents()
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.clearContents()
+            self.table.setRowCount(len(items))
+            for row, profile in enumerate(items):
+                values = [
+                    profile.name,
+                    profile.address,
+                    str(profile.port),
+                    profile.protocol.upper(),
+                    self._latency_label(profile),
+                    "Да" if profile.id == getattr(self, "_active_id", None) else "",
+                ]
+                for col, value in enumerate(values):
+                    table_item = QTableWidgetItem(value)
+                    table_item.setData(Qt.ItemDataRole.UserRole, profile.id)
+                    if profile.id == getattr(self, "_active_id", None):
+                        table_item.setForeground(QColor(0, 120, 212))
+                    self.table.setItem(row, col, table_item)
+            target_id = selected_id if selected_id in self._visible_ids else getattr(self, "_active_id", None)
+            if target_id in self._visible_ids:
+                self.table.selectRow(self._visible_ids.index(target_id))
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self.table.viewport().update()
 
     def _latency_label(self, profile: VlessProfile) -> str:
         if profile.latency_ms is not None:
@@ -593,6 +617,12 @@ class ServersPage(QWidget):
         selected = self.selected_id()
         if selected:
             signal.emit(selected)
+
+    def set_latency_busy(self, busy: bool) -> None:
+        self.ping_btn.setEnabled(not busy)
+        self.ping_all_btn.setEnabled(not busy)
+        self.sort_ping_btn.setEnabled(not busy)
+        self.ping_all_btn.setText("Пинг выполняется..." if busy else "Пинг всех")
 
 
 class SubscriptionsPage(QWidget):
@@ -677,20 +707,20 @@ class RoutingPage(QWidget):
         group_layout = QVBoxLayout(group)
         group_layout.setContentsMargins(18, 16, 18, 16)
         buttons = QHBoxLayout()
-        self.file_btn = PrimaryPushButton(FIF.FOLDER, "Загрузить JSON-файл", group)
+        self.file_btn = PrimaryPushButton(FIF.FOLDER, "Загрузить JSON/TXT-файл", group)
         self.url_btn = PushButton(FIF.DOWNLOAD, "Загрузить raw-ссылку", group)
         self.clear_btn = PushButton(FIF.DELETE, "Очистить все", group)
         buttons.addWidget(self.file_btn)
         buttons.addWidget(self.url_btn)
         buttons.addWidget(self.clear_btn)
         buttons.addStretch(1)
-        group_layout.addWidget(BodyLabel("JSON-наборы маршрутизации", group))
+        group_layout.addWidget(BodyLabel("Наборы маршрутизации", group))
         group_layout.addLayout(buttons)
         root.addWidget(group)
 
         self.table = TableWidget(self)
         self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["JSON", "Туннелирование", "Элементов", "Включен", "Источник", "Действия"])
+        self.table.setHorizontalHeaderLabels(["Набор", "Туннелирование", "Элементов", "Включен", "Источник", "Действия"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -874,7 +904,7 @@ class DomainActivityPage(QWidget):
 
         self.table = TableWidget(self)
         self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["Домен / поддомен", "Маршрут", "JSON-правило", "Запросов", "Первый раз", "Последний раз"])
+        self.table.setHorizontalHeaderLabels(["Домен / поддомен", "Маршрут", "Правило", "Запросов", "Первый раз", "Последний раз"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1061,7 +1091,9 @@ class AboutPage(QWidget):
             "Все данные хранятся локально. Сообщество может проверять код, открывать issues и присылать pull requests.\n\n"
             f"Репозиторий: {APP_REPOSITORY}\n\n"
             "Часть кода, графической архитектуры и дизайн-подходов адаптированы из open-source проекта "
-            f"zapret-kvn: {ZAPRET_KVN_REPOSITORY}",
+            f"zapret-kvn: {ZAPRET_KVN_REPOSITORY}\n\n"
+            "Спасибо проекту russia-mobile-internet-whitelist за домены из российского "
+            f"\"белого списка\" для встроенного bypass: {RUSSIA_MOBILE_WHITELIST_REPOSITORY}",
             card,
         )
         text.setWordWrap(True)
@@ -1069,6 +1101,7 @@ class AboutPage(QWidget):
         self.core_label = CaptionLabel("Core: sing-box", card)
         self.github_btn = PrimaryPushButton(FIF.LINK, "Открыть GitHub", card)
         self.zapret_btn = PushButton(FIF.LINK, "Открыть zapret-kvn", card)
+        self.whitelist_btn = PushButton(FIF.LINK, "Открыть whitelist", card)
         layout.addLayout(header)
         layout.addSpacing(8)
         layout.addWidget(text)
@@ -1077,12 +1110,14 @@ class AboutPage(QWidget):
         buttons = QHBoxLayout()
         buttons.addWidget(self.github_btn)
         buttons.addWidget(self.zapret_btn)
+        buttons.addWidget(self.whitelist_btn)
         buttons.addStretch(1)
         layout.addLayout(buttons)
         root.addWidget(card)
         root.addStretch(1)
         self.github_btn.clicked.connect(lambda: webbrowser.open(APP_REPOSITORY))
         self.zapret_btn.clicked.connect(lambda: webbrowser.open(ZAPRET_KVN_REPOSITORY))
+        self.whitelist_btn.clicked.connect(lambda: webbrowser.open(RUSSIA_MOBILE_WHITELIST_REPOSITORY))
 
     def set_core_version(self, version: str) -> None:
         self.core_label.setText(f"Core: {version}")
@@ -1112,6 +1147,10 @@ class RazreshenieWindow(FluentWindow):
         self.scheduler: RepeatingTask | None = None
         self._closing = False
         self._busy = False
+        self._ip_refreshing = False
+        self._ping_refreshing = False
+        self._latency_scan_running = False
+        self._core_version_cache: str | None = None
         self._last_ip_refresh = 0
         self._last_ping_refresh = 0
         self._ip_label = "IP: —"
@@ -1254,11 +1293,27 @@ class RazreshenieWindow(FluentWindow):
         self.subscriptions_page.set_subscriptions(self.subscriptions)
         self.routing_page.set_rules(self.split_rules, self._rules_summary_text())
         self.settings_page.set_values(self.settings)
-        self.about_page.set_core_version(self.singbox.version())
+        self.about_page.set_core_version(self._core_version())
         self.logs_page.set_lines(self.log_buffer.snapshot("all"))
         self.domain_activity.refresh_routes(self.split_rules)
         self._refresh_activity_page()
         self._refresh_tray_text()
+
+    def _refresh_server_views(self) -> None:
+        active = self._active_profile()
+        active_id = active.id if active else None
+        self.dashboard_page.set_profiles(self.profiles, active_id)
+        self.servers_page.set_profiles(self.profiles, active_id)
+
+    def _refresh_servers_table(self) -> None:
+        active = self._active_profile()
+        active_id = active.id if active else None
+        self.servers_page.set_profiles(self.profiles, active_id)
+
+    def _core_version(self, *, refresh: bool = False) -> str:
+        if refresh or self._core_version_cache is None:
+            self._core_version_cache = self.singbox.version()
+        return self._core_version_cache
 
     def _active_profile(self) -> VlessProfile | None:
         if self.settings.active_profile_id:
@@ -1407,21 +1462,40 @@ class RazreshenieWindow(FluentWindow):
             return
 
         def worker() -> int | None:
-            return measure_server_latency_ms(profile.address, profile.port)
+            return measure_server_latency_ms(profile.address, profile.port, LATENCY_SCAN_TIMEOUT_MS)
 
         self._run_background(worker, lambda latency: self._apply_single_latency_result(profile_id, latency), busy="Пинг сервера…")
 
     def test_all_latencies(self) -> None:
+        if self._latency_scan_running:
+            self._show_status("info", "Проверка отклика уже выполняется")
+            return
         if not self.profiles:
             self._show_status("warning", "Сначала импортируйте серверы")
             return
         snapshot = [(profile.id, profile.name, profile.address, profile.port) for profile in self.profiles]
+        self._latency_scan_running = True
+        self.servers_page.set_latency_busy(True)
 
-        def worker() -> list[tuple[str, int | None]]:
-            results: list[tuple[str, int | None]] = []
-            with ThreadPoolExecutor(max_workers=min(16, max(1, len(snapshot)))) as executor:
+        def worker() -> tuple[int, int]:
+            ok = 0
+            batch: list[tuple[str, int | None]] = []
+            last_flush = time.monotonic()
+
+            def flush_batch(force: bool = False) -> None:
+                nonlocal batch, last_flush
+                if not batch:
+                    return
+                if not force and len(batch) < 12 and time.monotonic() - last_flush < 0.35:
+                    return
+                send_batch = batch
+                batch = []
+                last_flush = time.monotonic()
+                self.bridge.call.emit(lambda send_batch=send_batch: self._apply_latency_result_batch(send_batch))
+
+            with ThreadPoolExecutor(max_workers=min(LATENCY_SCAN_WORKERS, max(1, len(snapshot)))) as executor:
                 futures = {
-                    executor.submit(measure_server_latency_ms, address, port): (profile_id, name)
+                    executor.submit(measure_server_latency_ms, address, port, LATENCY_SCAN_TIMEOUT_MS): (profile_id, name)
                     for profile_id, name, address, port in snapshot
                 }
                 for future in as_completed(futures):
@@ -1431,26 +1505,33 @@ class RazreshenieWindow(FluentWindow):
                     except Exception:
                         latency = None
                     self.logger.info("Отклик %s: %s", name, f"{latency} мс" if latency is not None else "таймаут")
-                    results.append((profile_id, latency))
-            return results
+                    ok += int(latency is not None)
+                    batch.append((profile_id, latency))
+                    flush_batch()
+            flush_batch(force=True)
+            return len(snapshot), ok
 
-        self._run_background(worker, self._apply_all_latency_results, busy=f"Пинг {len(snapshot)} серверов…")
+        self._run_background(worker, self._finish_latency_scan, busy=f"Пинг {len(snapshot)} серверов…")
 
     def _apply_single_latency_result(self, profile_id: str, latency: int | None) -> None:
         profile = self._set_profile_latency(profile_id, latency)
         app_state.save_profiles(self.profiles)
-        self._refresh_all_views()
+        self._refresh_servers_table()
         if profile:
             self._show_status("info", f"{profile.name}: {latency} мс" if latency is not None else f"{profile.name}: таймаут")
 
-    def _apply_all_latency_results(self, results: list[tuple[str, int | None]]) -> None:
-        ok = 0
+    def _apply_latency_result_batch(self, results: list[tuple[str, int | None]]) -> None:
         for profile_id, latency in results:
             self._set_profile_latency(profile_id, latency)
-            ok += int(latency is not None)
+        self._refresh_servers_table()
+
+    def _finish_latency_scan(self, stats: tuple[int, int]) -> None:
+        total, ok = stats
+        self._latency_scan_running = False
+        self.servers_page.set_latency_busy(False)
         app_state.save_profiles(self.profiles)
-        self._refresh_all_views()
-        self._show_status("success", f"Проверено: {len(results)}, успешно: {ok}, таймаутов: {len(results) - ok}")
+        self._refresh_server_views()
+        self._show_status("success", f"Проверено: {total}, успешно: {ok}, таймаутов: {total - ok}")
 
     def _set_profile_latency(self, profile_id: str, latency: int | None) -> VlessProfile | None:
         profile = self._profile_by_id(profile_id)
@@ -1463,7 +1544,7 @@ class RazreshenieWindow(FluentWindow):
     def sort_profiles_by_latency(self) -> None:
         self.profiles.sort(key=lambda item: (item.latency_ms is None, item.latency_ms or 10**9, item.name.lower()))
         app_state.save_profiles(self.profiles)
-        self._refresh_all_views()
+        self._refresh_server_views()
 
     def add_subscription(self) -> None:
         url, ok = QInputDialog.getText(self, "Добавить подписку", "URL подписки")
@@ -1492,16 +1573,52 @@ class RazreshenieWindow(FluentWindow):
         self._run_background(worker, lambda result: self._apply_subscription_update(result[1], result[0]), busy="Обновление подписки…")
 
     def _apply_subscription_update(self, subscription: Subscription, profiles: list[VlessProfile]) -> None:
-        self.profiles = [profile for profile in self.profiles if profile.subscription_id != subscription.id]
-        self.profiles.extend(profiles)
+        active_before = self._active_profile()
+        active_key = self.subscription_manager.profile_key(active_before) if active_before else None
+        old_subscription_profiles = [profile for profile in self.profiles if profile.subscription_id == subscription.id]
+        other_profiles = [profile for profile in self.profiles if profile.subscription_id != subscription.id]
+        merged_profiles, preserved_count = self._merge_subscription_profiles(old_subscription_profiles, profiles)
+        subscription.profile_count = len(merged_profiles)
+        self.profiles = other_profiles + merged_profiles
         self.subscriptions = [subscription if item.id == subscription.id else item for item in self.subscriptions]
+        if active_key and not any(profile.id == self.settings.active_profile_id for profile in self.profiles):
+            restored = next((profile for profile in merged_profiles if self.subscription_manager.profile_key(profile) == active_key), None)
+            self.settings.active_profile_id = restored.id if restored else ""
         if not self.settings.active_profile_id and self.profiles:
             self.settings.active_profile_id = self.profiles[0].id
         app_state.save_profiles(self.profiles)
         app_state.save_subscriptions(self.subscriptions)
         app_state.save_settings(self.settings)
         self._refresh_all_views()
-        self._show_status("success", f"Подписка обновлена: {subscription.name}")
+        suffix = f" · сохранено старых: {preserved_count}" if preserved_count else ""
+        self._show_status("success", f"Подписка обновлена: {subscription.name} · серверов: {subscription.profile_count}{suffix}")
+
+    def _merge_subscription_profiles(
+        self,
+        existing_profiles: list[VlessProfile],
+        incoming_profiles: list[VlessProfile],
+    ) -> tuple[list[VlessProfile], int]:
+        existing_by_key = {self.subscription_manager.profile_key(profile): profile for profile in existing_profiles}
+        incoming_keys: set[str] = set()
+        merged: list[VlessProfile] = []
+
+        for incoming in incoming_profiles:
+            key = self.subscription_manager.profile_key(incoming)
+            if key in incoming_keys:
+                continue
+            incoming_keys.add(key)
+            existing = existing_by_key.get(key)
+            if existing:
+                incoming.id = existing.id
+                incoming.created_at = existing.created_at
+                incoming.latency_ms = existing.latency_ms
+                incoming.latency_checked_at = existing.latency_checked_at
+            merged.append(incoming)
+
+        preserved = [profile for key, profile in existing_by_key.items() if key not in incoming_keys]
+        merged.extend(preserved)
+
+        return merged, len(preserved)
 
     def update_all_subscriptions(self) -> None:
         for subscription in list(self.subscriptions):
@@ -1521,16 +1638,25 @@ class RazreshenieWindow(FluentWindow):
         self._refresh_all_views()
 
     def load_rules_file(self) -> None:
-        file_name, _ = QFileDialog.getOpenFileName(self, "Загрузить JSON-правила", "", "JSON (*.json);;Все файлы (*.*)")
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Загрузить правила",
+            "",
+            "Правила (*.json *.txt);;JSON (*.json);;TXT (*.txt);;Все файлы (*.*)",
+        )
         if not file_name:
             return
-        self._load_rules(lambda: self.rules_manager.from_file(Path(file_name), ROUTE_OUTBOUND_PROXY))
+        path = Path(file_name)
+        default_outbound = ROUTE_OUTBOUND_DIRECT if path.suffix.lower() == ".txt" else ROUTE_OUTBOUND_PROXY
+        self._load_rules(lambda: self.rules_manager.from_file(path, default_outbound))
 
     def load_rules_url(self) -> None:
-        url, ok = QInputDialog.getText(self, "Загрузка правил", "Raw GitHub URL или другой прямой JSON URL")
+        url, ok = QInputDialog.getText(self, "Загрузка правил", "Raw GitHub URL на JSON или TXT")
         if not ok or not url.strip():
             return
-        self._load_rules(lambda: self.rules_manager.from_url(url.strip(), ROUTE_OUTBOUND_PROXY))
+        parsed = urlparse(url.strip())
+        default_outbound = ROUTE_OUTBOUND_DIRECT if Path(parsed.path).suffix.lower() == ".txt" else ROUTE_OUTBOUND_PROXY
+        self._load_rules(lambda: self.rules_manager.from_url(url.strip(), default_outbound))
 
     def _load_rules(self, loader: Callable[[], RoutingRuleSet]) -> None:
         try:
@@ -1543,7 +1669,7 @@ class RazreshenieWindow(FluentWindow):
         app_state.save_split_rules(self.split_rules)
         self._refresh_all_views()
         self.routing_page.select_rule(rule_set.id)
-        self._show_status("success", f"Добавлен JSON: {rule_set.name} · {rule_set.outbound_label} · {rule_set.total_items} элементов")
+        self._show_status("success", f"Добавлены правила: {rule_set.name} · {rule_set.outbound_label} · {rule_set.total_items} элементов")
 
     def set_rule_set_outbound(self, rule_set_id: str, outbound: str) -> None:
         rule_set = self._rule_set_by_id(rule_set_id)
@@ -1577,7 +1703,7 @@ class RazreshenieWindow(FluentWindow):
         rule_set = self._rule_set_by_id(rule_set_id)
         if not rule_set:
             return
-        if QMessageBox.question(self, "Удалить JSON-правила", f"Удалить {rule_set.name}?") != QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(self, "Удалить правила", f"Удалить {rule_set.name}?") != QMessageBox.StandardButton.Yes:
             return
         self.split_rules.rule_sets = [item for item in self.split_rules.rule_sets if item.id != rule_set_id]
         self.split_rules.enabled = any(item.enabled for item in self.split_rules.rule_sets)
@@ -1587,7 +1713,7 @@ class RazreshenieWindow(FluentWindow):
     def clear_rule_sets(self) -> None:
         if not self.split_rules.rule_sets:
             return
-        if QMessageBox.question(self, "Очистить маршрутизацию", "Удалить все JSON-наборы правил маршрутизации?") != QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(self, "Очистить маршрутизацию", "Удалить все наборы правил маршрутизации?") != QMessageBox.StandardButton.Yes:
             return
         self.split_rules = SplitRules(enabled=False)
         app_state.save_split_rules(self.split_rules)
@@ -1622,7 +1748,12 @@ class RazreshenieWindow(FluentWindow):
         self._run_background(worker, done, busy="Проверка config…")
 
     def download_core(self) -> None:
-        self._run_background(lambda: self.singbox.download_latest(), lambda exe: self._show_status("success", f"Установлен: {exe}"), busy="Загрузка sing-box…")
+        def done(exe: Path) -> None:
+            self._core_version_cache = None
+            self.about_page.set_core_version(self._core_version(refresh=True))
+            self._show_status("success", f"Установлен: {exe}")
+
+        self._run_background(lambda: self.singbox.download_latest(), done, busy="Загрузка sing-box…")
 
     def check_dns(self) -> None:
         self._run_background(lambda: check_dns_resolver(), lambda result: QMessageBox.information(self, "DNS leak check", result), busy="Проверка DNS…")
@@ -1703,14 +1834,31 @@ class RazreshenieWindow(FluentWindow):
         sample = self.traffic.sample()
         self._speed_label = f"↓ {format_speed(sample.download)}   ↑ {format_speed(sample.upload)}"
         now = int(time.time())
-        if now - self._last_ip_refresh > 30:
+        if now - self._last_ip_refresh > 30 and not self._ip_refreshing:
             self._last_ip_refresh = now
-            self._run_background(get_public_ip, lambda ip: self._set_ip(f"IP: {ip}"), set_busy=False)
-        if now - self._last_ping_refresh > 10:
+            self._ip_refreshing = True
+
+            def ip_done(ip: str) -> None:
+                self._set_ip(f"IP: {ip}")
+                self._ip_refreshing = False
+
+            self._run_background(get_public_ip, ip_done, set_busy=False)
+        if now - self._last_ping_refresh > 10 and not self._ping_refreshing:
             self._last_ping_refresh = now
             profile = self._active_profile()
             if profile:
-                self._run_background(lambda: ping_host(profile.address), lambda ping: self._set_ping(f"Пинг: {ping}"), set_busy=False)
+                self._ping_refreshing = True
+                address, port = profile.address, profile.port
+
+                def ping_worker() -> str:
+                    latency = measure_server_latency_ms(address, port, timeout_ms=1000)
+                    return f"{latency} мс" if latency is not None else "таймаут"
+
+                def ping_done(ping: str) -> None:
+                    self._set_ping(f"Пинг: {ping}")
+                    self._ping_refreshing = False
+
+                self._run_background(ping_worker, ping_done, set_busy=False)
         self.dashboard_page.set_metrics(self._ip_label, self._ping_label, self._speed_label, sample.download, sample.upload)
 
     def _set_ip(self, text: str) -> None:
@@ -1763,20 +1911,26 @@ class RazreshenieWindow(FluentWindow):
 
     def _rules_summary_line(self) -> str:
         status = "включены" if self.split_rules.enabled_rule_sets else "отключены"
+        default_label = "текущий сервер" if self.split_rules.effective_default_outbound == ROUTE_OUTBOUND_PROXY else "напрямую"
         return (
-            f"Правила: {status} · JSON-наборов: {len(self.split_rules.rule_sets)} · "
-            f"активных: {len(self.split_rules.enabled_rule_sets)}"
+            f"Правила: {status} · наборов: {len(self.split_rules.rule_sets)} · "
+            f"активных: {len(self.split_rules.enabled_rule_sets)} · остальной трафик: {default_label} · "
+            f"встроенный bypass: {len(BUILTIN_DIRECT_DOMAIN_SUFFIXES)} доменов"
         )
 
     def _rules_summary_text(self) -> str:
         lines = [
             self._rules_summary_line(),
             "",
-            "Каждый JSON-набор ниже имеет собственный маршрут: текущий сервер или напрямую.",
+            "Каждый набор ниже имеет собственный маршрут: текущий сервер или напрямую.",
+            (
+                f"Встроенный bypass всегда отправляет напрямую {len(BUILTIN_DIRECT_DOMAIN_SUFFIXES)} доменов "
+                f"из whitelist.json. Примеры: {', '.join(BUILTIN_DIRECT_DOMAIN_SUFFIXES[:12])}."
+            ),
             "",
         ]
         if not self.split_rules.rule_sets:
-            lines.append("JSON-правила не загружены.")
+            lines.append("Пользовательские правила не загружены.")
             return "\n".join(lines)
 
         for index, rule_set in enumerate(self.split_rules.rule_sets, start=1):

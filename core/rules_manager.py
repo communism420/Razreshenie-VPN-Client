@@ -13,7 +13,7 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 # GNU General Public License for more details.
 
-"""Импорт JSON-правил и нормализация для sing-box routing."""
+"""Импорт JSON/TXT-правил и нормализация для sing-box routing."""
 
 from __future__ import annotations
 
@@ -52,10 +52,10 @@ PROCESS_PATH_KEYS = {"process_path_regex", "process_path", "process_paths"}
 class RulesManager:
     def from_file(self, path: Path, outbound: str = ROUTE_OUTBOUND_PROXY) -> RoutingRuleSet:
         try:
-            data = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RulesImportError(f"Не удалось прочитать JSON-правила: {exc}") from exc
-        rules = self.from_json(data, outbound)
+            text = path.read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            raise RulesImportError(f"Не удалось прочитать файл правил: {exc}") from exc
+        rules = self._from_text_or_json(text, outbound, source_hint=path.suffix)
         rules.name = path.stem
         rules.source_type = "file"
         rules.source = str(path)
@@ -65,15 +65,25 @@ class RulesManager:
         try:
             response = requests.get(url, timeout=20, headers={"User-Agent": "RazreshenieVPN/1.0"})
             response.raise_for_status()
-            data = response.json()
-        except (requests.RequestException, json.JSONDecodeError) as exc:
-            raise RulesImportError(f"Не удалось загрузить JSON-правила: {exc}") from exc
-        rules = self.from_json(data, outbound)
+        except requests.RequestException as exc:
+            raise RulesImportError(f"Не удалось загрузить правила: {exc}") from exc
         parsed = urlparse(url)
+        rules = self._from_text_or_json(response.text, outbound, source_hint=Path(parsed.path).suffix)
         rules.name = Path(parsed.path).stem or parsed.netloc or "URL-правила"
         rules.source_type = "url"
         rules.source = url
         return rules
+
+    def _from_text_or_json(self, text: str, outbound: str, source_hint: str = "") -> RoutingRuleSet:
+        suffix = source_hint.lower()
+        if suffix == ".txt":
+            return self.from_text(text, outbound)
+        try:
+            return self.from_json(json.loads(text), outbound)
+        except json.JSONDecodeError as json_error:
+            if suffix == ".json":
+                raise RulesImportError(f"Не удалось прочитать JSON-правила: {json_error}") from json_error
+            return self.from_text(text, outbound)
 
     def from_json(self, data: Any, outbound: str = ROUTE_OUTBOUND_PROXY) -> RoutingRuleSet:
         rules = RoutingRuleSet(enabled=True, outbound=normalize_outbound(outbound))
@@ -87,6 +97,37 @@ class RulesManager:
         if rules.is_empty:
             raise RulesImportError("JSON не содержит доменов, IP/CIDR или process-правил")
         return rules
+
+    def from_text(self, text: str, outbound: str = ROUTE_OUTBOUND_PROXY) -> RoutingRuleSet:
+        rules = RoutingRuleSet(enabled=True, outbound=normalize_outbound(outbound))
+        invalid_count = 0
+        for line in text.splitlines():
+            item = self._clean_text_line(line)
+            if not item:
+                continue
+            if self._looks_like_cidr(item):
+                self._add_ip(item, rules)
+            elif self._looks_like_domain(item):
+                self._add_domain(item, "domain", rules)
+            else:
+                invalid_count += 1
+        rules.domains = sorted(set(rules.domains))
+        rules.domain_suffix = sorted(set(rules.domain_suffix))
+        rules.ip_cidr = sorted(set(rules.ip_cidr))
+        if rules.is_empty:
+            detail = f"; пропущено строк: {invalid_count}" if invalid_count else ""
+            raise RulesImportError(f"TXT не содержит доменов или IP/CIDR{detail}")
+        return rules
+
+    @staticmethod
+    def _clean_text_line(line: str) -> str:
+        text = line.strip()
+        if not text or text.startswith(("#", ";", "//")):
+            return ""
+        for marker in (" #", " ;", " //"):
+            if marker in text:
+                text = text.split(marker, 1)[0].strip()
+        return text
 
     def _walk(self, value: Any, key: str | None, rules: RoutingRuleSet) -> None:
         normalized_key = (key or "").lower().replace("-", "_")

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import os
 from typing import Any
 
 
@@ -32,7 +33,7 @@ class AppSettings:
     mixed_port: int = 2080
     tun_interface_name: str = "Razreshenie"
     tun_address: str = "172.19.0.1/30"
-    tun_mtu: int = 9000
+    tun_mtu: int = 4064
     dns_servers: list[str] = field(default_factory=lambda: ["1.1.1.1", "8.8.8.8"])
     kill_switch: bool = False
     enable_system_proxy_guard: bool = False
@@ -54,6 +55,8 @@ class AppSettings:
         for key in ("mixed_port", "tun_mtu", "subscription_update_interval_hours"):
             if key in safe:
                 safe[key] = int(safe[key])
+        if os.name == "nt" and int(safe.get("tun_mtu") or 4064) > 4064:
+            safe["tun_mtu"] = 4064
         return cls(**{key: safe[key] for key in cls.__dataclass_fields__ if key in safe})
 
     def to_dict(self) -> dict[str, Any]:

@@ -22,7 +22,14 @@ import time
 from dataclasses import dataclass
 from threading import RLock
 
-from models.rules import ROUTE_OUTBOUND_DIRECT, ROUTE_OUTBOUND_PROXY, RoutingRuleSet, SplitRules, normalize_outbound
+from models.rules import (
+    ROUTE_OUTBOUND_DIRECT,
+    ROUTE_OUTBOUND_PROXY,
+    RoutingRuleSet,
+    SplitRules,
+    builtin_direct_rule_sets,
+    normalize_outbound,
+)
 
 
 DOMAIN_RE = re.compile(
@@ -154,10 +161,10 @@ class DomainActivityTracker:
         return None
 
     def _classify_domain(self, domain: str, split_rules: SplitRules) -> tuple[str, str]:
-        for rule_set in split_rules.enabled_rule_sets:
+        for rule_set in [*split_rules.enabled_rule_sets, *builtin_direct_rule_sets()]:
             if self._matches_rule_set(domain, rule_set):
                 return normalize_outbound(rule_set.outbound), rule_set.name
-        return ROUTE_OUTBOUND_PROXY, "Маршрут по умолчанию"
+        return split_rules.effective_default_outbound, "Маршрут по умолчанию"
 
     def _matches_rule_set(self, domain: str, rule_set: RoutingRuleSet) -> bool:
         if domain in set(rule_set.domains):

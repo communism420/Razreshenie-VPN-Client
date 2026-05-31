@@ -17,9 +17,13 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
+from urllib.parse import urlparse
+
+from utils.paths import resource_path
 
 
 SPLIT_PROXY_ONLY = "proxy_only"
@@ -27,6 +31,23 @@ SPLIT_BYPASS = "bypass"
 ROUTE_OUTBOUND_PROXY = "proxy"
 ROUTE_OUTBOUND_DIRECT = "direct"
 ROUTE_OUTBOUNDS = {ROUTE_OUTBOUND_PROXY, ROUTE_OUTBOUND_DIRECT}
+BUILTIN_DIRECT_RULE_ID = "builtin-direct-russian-sites"
+BUILTIN_DIRECT_RULE_NAME = "Встроенный bypass: whitelist"
+BUILTIN_DIRECT_SOURCE = "assets/rules/builtin_bypass_whitelist.json"
+BUILTIN_DIRECT_FALLBACK_DOMAIN_SUFFIXES = (
+    "wildberries.ru",
+    "wb.ru",
+    "wbbasket.ru",
+    "wbstatic.net",
+)
+BUILTIN_DOMAIN_KEYS = {
+    "domain",
+    "domains",
+    "domain_suffix",
+    "domain_suffixes",
+    "host",
+    "hosts",
+}
 
 
 def _new_rule_id() -> str:
@@ -40,6 +61,66 @@ def normalize_outbound(value: str | None) -> str:
     if text in {"direct", "bypass", "напрямую", "прямой"}:
         return ROUTE_OUTBOUND_DIRECT
     return ROUTE_OUTBOUND_PROXY
+
+
+def _clean_builtin_domain(value: str) -> str:
+    text = value.strip().lower()
+    text = text.removeprefix("regexp:")
+    text = text.removeprefix("geosite:")
+    text = text.removeprefix("domain:")
+    text = text.removeprefix("full:")
+    if "://" in text:
+        parsed = urlparse(text)
+        text = parsed.hostname or ""
+    text = text.split("/")[0].strip()
+    text = text.removeprefix("*.").removeprefix(".")
+    return text
+
+
+def _walk_builtin_domains(value: Any, key: str | None, domains: set[str]) -> None:
+    normalized_key = (key or "").lower().replace("-", "_")
+    if isinstance(value, dict):
+        for item_key, item_value in value.items():
+            _walk_builtin_domains(item_value, item_key, domains)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _walk_builtin_domains(item, key, domains)
+        return
+    if normalized_key not in BUILTIN_DOMAIN_KEYS:
+        return
+    text = _clean_builtin_domain(str(value))
+    if text and "." in text:
+        domains.add(text)
+
+
+def _load_builtin_direct_domain_suffixes() -> tuple[str, ...]:
+    domains = set(BUILTIN_DIRECT_FALLBACK_DOMAIN_SUFFIXES)
+    path = resource_path("assets", "rules", "builtin_bypass_whitelist.json")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return tuple(sorted(domains))
+    _walk_builtin_domains(data, None, domains)
+    return tuple(sorted(domains))
+
+
+BUILTIN_DIRECT_DOMAIN_SUFFIXES = _load_builtin_direct_domain_suffixes()
+
+
+def builtin_direct_rule_sets() -> list["RoutingRuleSet"]:
+    """Встроенный bypass для сайтов, которые часто блокируют VPN-адреса."""
+    return [
+        RoutingRuleSet(
+            id=BUILTIN_DIRECT_RULE_ID,
+            name=BUILTIN_DIRECT_RULE_NAME,
+            enabled=True,
+            outbound=ROUTE_OUTBOUND_DIRECT,
+            source_type="builtin",
+            source=BUILTIN_DIRECT_SOURCE,
+            domain_suffix=list(BUILTIN_DIRECT_DOMAIN_SUFFIXES),
+        )
+    ]
 
 
 @dataclass(slots=True)
@@ -167,6 +248,21 @@ class SplitRules:
         if not self.enabled:
             return []
         return [rule_set for rule_set in self.rule_sets if rule_set.enabled and not rule_set.is_empty]
+
+    @property
+    def effective_default_outbound(self) -> str:
+        """Автоматически выбирает маршрут для трафика вне JSON-наборов."""
+        active = self.enabled_rule_sets
+        if not active:
+            return ROUTE_OUTBOUND_PROXY
+
+        has_proxy_rules = any(normalize_outbound(rule_set.outbound) == ROUTE_OUTBOUND_PROXY for rule_set in active)
+        has_direct_rules = any(normalize_outbound(rule_set.outbound) == ROUTE_OUTBOUND_DIRECT for rule_set in active)
+        if has_proxy_rules and not has_direct_rules:
+            return ROUTE_OUTBOUND_DIRECT
+        if has_direct_rules and not has_proxy_rules:
+            return ROUTE_OUTBOUND_PROXY
+        return normalize_outbound(self.default_outbound)
 
     @property
     def total_items(self) -> int:

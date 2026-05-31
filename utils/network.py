@@ -28,6 +28,20 @@ import psutil
 import requests
 
 
+def _subprocess_no_window_kwargs() -> dict[str, object]:
+    """Параметры subprocess для скрытого запуска консольных утилит Windows."""
+    if platform.system().lower() != "windows":
+        return {}
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "startupinfo": startupinfo,
+    }
+
+
 def get_public_ip(timeout: float = 5.0) -> str:
     for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
         try:
@@ -60,24 +74,26 @@ def measure_tcp_latency_ms(host: str, port: int, timeout_ms: int = 1500) -> int 
 def measure_icmp_latency_ms(host: str, timeout_ms: int = 1500) -> int | None:
     if not host:
         return None
-    count_arg = "-n" if platform.system().lower() == "windows" else "-c"
-    timeout_arg = "-w" if platform.system().lower() == "windows" else "-W"
-    timeout_value = str(timeout_ms if platform.system().lower() == "windows" else max(1, timeout_ms // 1000))
+    is_windows = platform.system().lower() == "windows"
+    command = "ping.exe" if is_windows else "ping"
+    count_arg = "-n" if is_windows else "-c"
+    timeout_arg = "-w" if is_windows else "-W"
+    timeout_value = str(timeout_ms if is_windows else max(1, timeout_ms // 1000))
     try:
         proc = subprocess.run(
-            ["ping", count_arg, "1", timeout_arg, timeout_value, host],
+            [command, count_arg, "1", timeout_arg, timeout_value, host],
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
             timeout=max(2.0, timeout_ms / 1000 + 1),
             check=False,
+            **_subprocess_no_window_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
 
-    output = proc.stdout + proc.stderr
-    match = re.search(r"(?:time|время)[=<]\s*(\d+)\s*ms", output, re.IGNORECASE)
+    encoding = "oem" if is_windows else "utf-8"
+    output = (proc.stdout or b"").decode(encoding, errors="ignore")
+    output += (proc.stderr or b"").decode(encoding, errors="ignore")
+    match = re.search(r"(?:time|время)[=<]\s*(\d+)\s*(?:ms|мс)", output, re.IGNORECASE)
     if match:
         return int(match.group(1))
     return None
