@@ -938,11 +938,12 @@ class SubscriptionsPage(QWidget):
         self.update_btn.clicked.connect(lambda: self._emit_selected(self.update_requested))
         self.delete_btn.clicked.connect(lambda: self._emit_selected(self.delete_requested))
 
-    def set_subscriptions(self, subscriptions: list[Subscription]) -> None:
+    def set_subscriptions(self, subscriptions: list[Subscription], profile_counts: dict[str, int] | None = None) -> None:
         self._ids = [item.id for item in subscriptions]
         self.table.setRowCount(len(subscriptions))
         for row, sub in enumerate(subscriptions):
-            values = [sub.name, sub.url, str(sub.profile_count), sub.last_update_at or "никогда", sub.last_error or ""]
+            profile_count = sub.profile_count if profile_counts is None else profile_counts.get(sub.id, sub.profile_count)
+            values = [sub.name, sub.url, str(profile_count), sub.last_update_at or "никогда", sub.last_error or ""]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, sub.id)
@@ -1418,6 +1419,7 @@ class RazreshenieWindow(FluentWindow):
         self.split_rules = app_state.load_split_rules()
         self.rules_manager = RulesManager()
         self.subscription_manager = SubscriptionManager()
+        self._sync_subscription_profile_counts(save=True)
         self.singbox = SingBoxManager(self.logger)
         self.latency_scanner = LatencyScanner(
             timeout_ms=LATENCY_SCAN_TIMEOUT_MS,
@@ -1574,6 +1576,7 @@ class RazreshenieWindow(FluentWindow):
 
     def _refresh_all_views(self) -> None:
         self._rebuild_profile_index()
+        subscription_counts = self._sync_subscription_profile_counts(save=False)
         active = self._active_profile()
         active_id = active.id if active else None
         self.dashboard_page.set_profiles(self.profiles, active_id)
@@ -1581,7 +1584,7 @@ class RazreshenieWindow(FluentWindow):
         self.dashboard_page.set_connection(self.singbox.is_running(), self._busy)
         self.dashboard_page.set_rules_summary(self._rules_summary_line())
         self.servers_page.set_profiles(self.profiles, active_id, self.subscriptions)
-        self.subscriptions_page.set_subscriptions(self.subscriptions)
+        self.subscriptions_page.set_subscriptions(self.subscriptions, subscription_counts)
         self.routing_page.set_rules(self.split_rules, self._rules_summary_text())
         self.settings_page.set_values(self.settings)
         self.about_page.set_core_version(self._core_version())
@@ -1602,6 +1605,26 @@ class RazreshenieWindow(FluentWindow):
         active = self._active_profile()
         active_id = active.id if active else None
         self.servers_page.set_profiles(self.profiles, active_id, self.subscriptions)
+
+    def _subscription_profile_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for profile in self.profiles:
+            if not profile.subscription_id:
+                continue
+            counts[profile.subscription_id] = counts.get(profile.subscription_id, 0) + 1
+        return counts
+
+    def _sync_subscription_profile_counts(self, *, save: bool) -> dict[str, int]:
+        counts = self._subscription_profile_counts()
+        changed = False
+        for subscription in self.subscriptions:
+            actual_count = counts.get(subscription.id, 0)
+            if subscription.profile_count != actual_count:
+                subscription.profile_count = actual_count
+                changed = True
+        if changed and save:
+            app_state.save_subscriptions(self.subscriptions)
+        return counts
 
     def _core_version(self, *, refresh: bool = False) -> str:
         if refresh or self._core_version_cache is None:
@@ -1926,6 +1949,8 @@ class RazreshenieWindow(FluentWindow):
             self.update_subscription(subscription)
 
     def update_subscription(self, subscription: Subscription) -> None:
+        self._sync_subscription_profile_counts(save=True)
+
         def worker() -> tuple[list[VlessProfile], Subscription]:
             return self.subscription_manager.fetch(subscription)
 
@@ -1940,6 +1965,7 @@ class RazreshenieWindow(FluentWindow):
         subscription.profile_count = len(merged_profiles)
         self.profiles = other_profiles + merged_profiles
         self.subscriptions = [subscription if item.id == subscription.id else item for item in self.subscriptions]
+        subscription_counts = self._sync_subscription_profile_counts(save=False)
         if active_key and not any(profile.id == self.settings.active_profile_id for profile in self.profiles):
             restored = next((profile for profile in merged_profiles if self.subscription_manager.profile_key(profile) == active_key), None)
             self.settings.active_profile_id = restored.id if restored else ""
@@ -1949,7 +1975,7 @@ class RazreshenieWindow(FluentWindow):
         app_state.save_subscriptions(self.subscriptions)
         app_state.save_settings(self.settings)
         self._refresh_server_views()
-        self.subscriptions_page.set_subscriptions(self.subscriptions)
+        self.subscriptions_page.set_subscriptions(self.subscriptions, subscription_counts)
         self._refresh_tray_text()
         self._show_status("success", f"Подписка обновлена: {subscription.name} · серверов: {subscription.profile_count}")
 
@@ -1958,17 +1984,18 @@ class RazreshenieWindow(FluentWindow):
         existing_profiles: list[VlessProfile],
         incoming_profiles: list[VlessProfile],
     ) -> list[VlessProfile]:
-        existing_by_key = {self.subscription_manager.profile_key(profile): profile for profile in existing_profiles}
-        incoming_keys: set[str] = set()
+        existing_by_key: dict[str, deque[VlessProfile]] = {}
+        for profile in existing_profiles:
+            key = self.subscription_manager.profile_key(profile)
+            existing_by_key.setdefault(key, deque()).append(profile)
+
         merged: list[VlessProfile] = []
 
         for incoming in incoming_profiles:
             key = self.subscription_manager.profile_key(incoming)
-            if key in incoming_keys:
-                continue
-            incoming_keys.add(key)
-            existing = existing_by_key.get(key)
-            if existing:
+            existing_profiles_for_key = existing_by_key.get(key)
+            existing = existing_profiles_for_key.popleft() if existing_profiles_for_key else None
+            if existing is not None:
                 incoming.id = existing.id
                 incoming.created_at = existing.created_at
                 incoming.latency_ms = existing.latency_ms

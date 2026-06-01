@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 build/
 dist/
+exe_release/
 *.spec
 data/
 portable.flag

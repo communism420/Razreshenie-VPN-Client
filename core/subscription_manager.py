@@ -120,36 +120,69 @@ class SubscriptionManager:
     def parse_text(self, text: str, subscription_id: str | None = None) -> list[VlessProfile]:
         payload = self._decode_if_base64(text)
         profiles: list[VlessProfile] = []
-        seen: set[str] = set()
         errors: list[str] = []
 
-        for outbound in self._extract_json_vless_outbounds(payload):
+        json_outbounds = self._extract_json_vless_outbounds(payload)
+        json_links = self._extract_json_links(payload)
+
+        for outbound in json_outbounds:
             try:
                 profile = parse_vless_outbound(outbound, subscription_id=subscription_id)
-                key = self.profile_key(profile)
-                if key not in seen:
-                    seen.add(key)
-                    profiles.append(profile)
+                profiles.append(profile)
             except VlessParseError as exc:
                 errors.append(str(exc))
 
-        links = [*self._extract_json_links(payload), *self._extract_links(payload)]
+        # Karing считает каждую запись подписки отдельным сервером, даже если
+        # провайдер повторил один и тот же VLESS-ключ несколько раз. Поэтому
+        # здесь намеренно нет дедупликации по endpoint/name/params.
+        links = json_links if json_outbounds or json_links else self._extract_links(payload)
         for link in links:
             try:
                 profile = parse_vless_uri(link, subscription_id=subscription_id)
             except VlessParseError as exc:
                 errors.append(str(exc))
                 continue
-            key = self.profile_key(profile)
-            if key in seen:
-                continue
-            seen.add(key)
             profiles.append(profile)
 
         if not profiles:
             details = f": {'; '.join(errors[:3])}" if errors else ""
             raise SubscriptionError(f"В подписке не найдено корректных VLESS-ключей{details}")
+        return self._append_duplicate_name_suffixes(profiles)
+
+    @staticmethod
+    def _append_duplicate_name_suffixes(profiles: list[VlessProfile]) -> list[VlessProfile]:
+        """Добавляет `-1`, `-2` к повторяющимся именам серверов."""
+        totals: dict[str, int] = {}
+        for profile in profiles:
+            key = SubscriptionManager._name_key(profile.name)
+            totals[key] = totals.get(key, 0) + 1
+
+        seen: dict[str, int] = {}
+        used_names = {profile.name for profile in profiles}
+        for profile in profiles:
+            key = SubscriptionManager._name_key(profile.name)
+            if totals.get(key, 0) <= 1:
+                continue
+
+            occurrence = seen.get(key, 0)
+            seen[key] = occurrence + 1
+            if occurrence == 0:
+                continue
+
+            base_name = profile.name
+            suffix_index = occurrence
+            candidate = f"{base_name}-{suffix_index}"
+            while candidate in used_names:
+                suffix_index += 1
+                candidate = f"{base_name}-{suffix_index}"
+            profile.name = candidate
+            used_names.add(candidate)
+
         return profiles
+
+    @staticmethod
+    def _name_key(name: str) -> str:
+        return " ".join(str(name or "").casefold().split())
 
     def _decode_if_base64(self, text: str) -> str:
         raw = text.strip()
