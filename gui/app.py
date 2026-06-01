@@ -1365,9 +1365,7 @@ class DomainActivityTableModel(QAbstractTableModel):
             if route == ROUTE_OUTBOUND_DIRECT:
                 return QBrush(QColor(0, 220, 120))
         if role == Qt.ItemDataRole.TextAlignmentRole:
-            if column == 3:
-                return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            return Qt.AlignmentFlag.AlignVCenter
+            return Qt.AlignmentFlag.AlignCenter
         return None
 
     def headerData(
@@ -1376,6 +1374,8 @@ class DomainActivityTableModel(QAbstractTableModel):
         orientation: Qt.Orientation,
         role: int = Qt.ItemDataRole.DisplayRole,
     ) -> object:
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            return Qt.AlignmentFlag.AlignCenter
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if orientation == Qt.Orientation.Horizontal and 0 <= section < len(ACTIVITY_COLUMNS):
@@ -1450,6 +1450,7 @@ class DomainActivityPage(QWidget):
         self.table.setSortingEnabled(False)
         self.table.verticalHeader().setDefaultSectionSize(30)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         for col in (1, 3, 4, 5):
