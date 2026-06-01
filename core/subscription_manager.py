@@ -21,8 +21,8 @@ import base64
 import binascii
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from time import sleep
 from typing import Any
 
 import requests
@@ -36,6 +36,13 @@ class SubscriptionError(ValueError):
 
 
 FETCH_ATTEMPTS = 3
+FETCH_TIMEOUT_SECONDS = 15
+REQUEST_HEADERS = {
+    "User-Agent": "RazreshenieVPN/1.1",
+    "Accept": "text/plain, application/json, */*",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
 
 def _utc_now() -> str:
@@ -44,42 +51,67 @@ def _utc_now() -> str:
 
 class SubscriptionManager:
     def fetch(self, subscription: Subscription) -> tuple[list[VlessProfile], Subscription]:
-        profiles_by_key: dict[str, VlessProfile] = {}
+        best_profiles: list[VlessProfile] = []
         errors: list[str] = []
+        expected_count = max(0, int(subscription.profile_count or 0))
 
-        for attempt in range(1, FETCH_ATTEMPTS + 1):
-            try:
-                response = requests.get(
-                    subscription.url,
-                    timeout=30,
-                    headers={
-                        "User-Agent": "RazreshenieVPN/1.0",
-                        "Accept": "text/plain, application/json, */*",
-                        "Cache-Control": "no-cache",
-                        "Pragma": "no-cache",
-                    },
-                )
-                response.raise_for_status()
-                fetched_profiles = self.parse_text(response.text, subscription.id)
-            except (requests.RequestException, SubscriptionError) as exc:
-                errors.append(str(exc))
-                if attempt < FETCH_ATTEMPTS:
-                    sleep(0.35 * attempt)
-                continue
+        try:
+            best_profiles = self._fetch_once(subscription)
+        except (requests.RequestException, SubscriptionError) as exc:
+            errors.append(str(exc))
 
-            for profile in fetched_profiles:
-                profiles_by_key.setdefault(self.profile_key(profile), profile)
+        if best_profiles and (not expected_count or len(best_profiles) >= expected_count):
+            return self._finish_fetch(subscription, best_profiles)
 
-            # Если вторая попытка не дала новых серверов, третья обычно не нужна.
-            if attempt > 1 and len(profiles_by_key) == len(fetched_profiles):
-                break
+        # Повторные запросы нужны только против временно неполного ответа.
+        # Они идут параллельно, а не последовательно, и не суммируются между
+        # собой: берем один самый полный снимок подписки.
+        retry_count = FETCH_ATTEMPTS - 1
+        if retry_count > 0:
+            retry_profiles = self._fetch_retries(subscription, retry_count, errors)
+            if len(retry_profiles) > len(best_profiles):
+                best_profiles = retry_profiles
 
-        if not profiles_by_key:
+        if not best_profiles:
             message = errors[-1] if errors else "пустой ответ"
             subscription.last_error = message
             raise SubscriptionError(f"Не удалось загрузить подписку: {message}")
 
-        profiles = list(profiles_by_key.values())
+        return self._finish_fetch(subscription, best_profiles)
+
+    def _fetch_once(self, subscription: Subscription) -> list[VlessProfile]:
+        response = requests.get(
+            subscription.url,
+            timeout=FETCH_TIMEOUT_SECONDS,
+            headers=REQUEST_HEADERS,
+        )
+        response.raise_for_status()
+        return self.parse_text(response.text, subscription.id)
+
+    def _fetch_retries(
+        self,
+        subscription: Subscription,
+        retry_count: int,
+        errors: list[str],
+    ) -> list[VlessProfile]:
+        best_profiles: list[VlessProfile] = []
+        with ThreadPoolExecutor(max_workers=max(1, retry_count), thread_name_prefix="SubscriptionFetch") as executor:
+            futures = [executor.submit(self._fetch_once, subscription) for _ in range(retry_count)]
+            for future in as_completed(futures):
+                try:
+                    fetched_profiles = future.result()
+                except (requests.RequestException, SubscriptionError) as exc:
+                    errors.append(str(exc))
+                    continue
+                if len(fetched_profiles) > len(best_profiles):
+                    best_profiles = fetched_profiles
+        return best_profiles
+
+    @staticmethod
+    def _finish_fetch(
+        subscription: Subscription,
+        profiles: list[VlessProfile],
+    ) -> tuple[list[VlessProfile], Subscription]:
         subscription.last_update_at = _utc_now()
         subscription.last_error = None
         subscription.profile_count = len(profiles)

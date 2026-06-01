@@ -99,10 +99,20 @@ def measure_icmp_latency_ms(host: str, timeout_ms: int = 1500) -> int | None:
     return None
 
 
-def measure_server_latency_ms(host: str, port: int, timeout_ms: int = 1500) -> int | None:
-    """Меряет отклик сервера: TCP handshake к proxy port, затем ICMP fallback."""
+def measure_server_latency_ms(
+    host: str,
+    port: int,
+    timeout_ms: int = 1500,
+    *,
+    icmp_fallback: bool = False,
+) -> int | None:
+    """Меряет отклик сервера по TCP handshake к proxy port.
+
+    ICMP fallback по умолчанию выключен: массовая проверка серверов не должна
+    запускать сотни процессов ping.exe и нагружать интерфейс Windows.
+    """
     latency = measure_tcp_latency_ms(host, port, timeout_ms)
-    if latency is not None:
+    if latency is not None or not icmp_fallback:
         return latency
     return measure_icmp_latency_ms(host, timeout_ms)
 

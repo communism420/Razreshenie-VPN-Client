@@ -24,12 +24,11 @@ import threading
 import time
 import webbrowser
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
-from PyQt6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QObject, QPointF, QRectF, QSize, Qt, QTimer, QVariantAnimation, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QColor, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -78,6 +77,7 @@ from qfluentwidgets import (
 
 from core import app_state
 from core.domain_activity import DomainActivityEntry, DomainActivityTracker
+from core.latency_scanner import LatencyScanner, LatencyScanSummary
 from core.rules_manager import RulesImportError, RulesManager
 from core.singbox_manager import SingBoxError, SingBoxManager
 from core.subscription_manager import SubscriptionError, SubscriptionManager
@@ -114,8 +114,12 @@ from utils.version import (
 ACCENT = "#0078D4"
 DANGER = "#D83B01"
 SUCCESS = "#16C60C"
-LATENCY_SCAN_TIMEOUT_MS = 1200
-LATENCY_SCAN_WORKERS = 6
+LATENCY_SCAN_TIMEOUT_MS = 900
+LATENCY_SCAN_WORKERS = 32
+LATENCY_BATCH_SIZE = 48
+LATENCY_BATCH_INTERVAL_SECONDS = 0.25
+LATENCY_UI_DRAIN_INTERVAL_MS = 16
+LATENCY_UI_DRAIN_LIMIT = 24
 
 
 def app_logo_icon() -> QIcon:
@@ -424,6 +428,13 @@ class DashboardPage(QWidget):
             self.connection_status.setText("Активный профиль не выбран")
         self.profile_combo.blockSignals(False)
 
+    def set_active_profile(self, profile: VlessProfile) -> None:
+        if profile.id in self._profile_ids:
+            self.profile_combo.blockSignals(True)
+            self.profile_combo.setCurrentIndex(self._profile_ids.index(profile.id))
+            self.profile_combo.blockSignals(False)
+        self.connection_status.setText(profile.label)
+
     def set_mode(self, mode: str) -> None:
         index = 1 if mode == "tun" else 0
         self.mode_combo.blockSignals(True)
@@ -483,7 +494,14 @@ class ServersPage(QWidget):
         super().__init__(parent)
         self.setObjectName("servers")
         self._profiles: list[VlessProfile] = []
+        self._profile_by_id: dict[str, VlessProfile] = {}
+        self._subscription_names: dict[str, str] = {}
+        self._collapsed_groups: set[str] = set()
+        self._row_entries: list[tuple[str, str]] = []
         self._visible_ids: list[str] = []
+        self._row_by_id: dict[str, int] = {}
+        self._active_id: str | None = None
+        self._group_animation: QVariantAnimation | None = None
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 20)
         root.setSpacing(12)
@@ -501,16 +519,15 @@ class ServersPage(QWidget):
 
         toolbar = QHBoxLayout()
         self.import_btn = PrimaryPushButton(FIF.ADD, "Импорт", self)
-        self.activate_btn = PushButton(FIF.CHECKBOX, "Активировать", self)
         self.edit_btn = PushButton(FIF.EDIT, "JSON", self)
         self.ping_btn = PushButton(FIF.SEND, "Пинг выбранного", self)
         self.ping_all_btn = PushButton(FIF.SYNC, "Пинг всех", self)
+        self.ping_all_btn.setFixedWidth(150)
         self.sort_ping_btn = PushButton(FIF.SPEED_HIGH, "Сортировать по отклику", self)
         self.validate_btn = PushButton(FIF.CODE, "Проверить config", self)
         self.delete_btn = PushButton(FIF.DELETE, "Удалить", self)
         for widget in (
             self.import_btn,
-            self.activate_btn,
             self.edit_btn,
             self.ping_btn,
             self.ping_all_btn,
@@ -532,15 +549,16 @@ class ServersPage(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setDefaultSectionSize(34)
-        for col in (2, 3, 4, 5):
-            self.table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        fixed_columns = {2: 72, 3: 82, 4: 96, 5: 86}
+        for col, width in fixed_columns.items():
+            self.table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+            self.table.setColumnWidth(col, width)
         root.addWidget(self.table, 1)
 
         self.search.textChanged.connect(self.reload)
         self.sort_combo.currentIndexChanged.connect(self.reload)
-        self.table.itemDoubleClicked.connect(lambda _item: self._emit_activate())
+        self.table.cellPressed.connect(self._activate_pressed_cell)
         self.import_btn.clicked.connect(self.import_requested)
-        self.activate_btn.clicked.connect(self._emit_activate)
         self.edit_btn.clicked.connect(lambda: self._emit_for_selected(self.edit_requested))
         self.delete_btn.clicked.connect(lambda: self._emit_for_selected(self.delete_requested))
         self.ping_btn.clicked.connect(lambda: self._emit_for_selected(self.ping_requested))
@@ -548,40 +566,61 @@ class ServersPage(QWidget):
         self.sort_ping_btn.clicked.connect(self.sort_latency_requested)
         self.validate_btn.clicked.connect(self.validate_requested)
 
-    def set_profiles(self, profiles: list[VlessProfile], active_id: str | None) -> None:
+    def set_profiles(
+        self,
+        profiles: list[VlessProfile],
+        active_id: str | None,
+        subscriptions: list[Subscription] | None = None,
+    ) -> None:
         self._profiles = list(profiles)
+        self._profile_by_id = {profile.id: profile for profile in self._profiles}
+        if subscriptions is not None:
+            self._subscription_names = {subscription.id: subscription.name for subscription in subscriptions}
         self._active_id = active_id
         self.reload()
 
+    def set_active_id(self, active_id: str | None) -> None:
+        if self._active_id == active_id:
+            return
+        previous_id = self._active_id
+        self._active_id = active_id
+        self._update_active_row(previous_id)
+        self._update_active_row(active_id)
+
     def selected_id(self) -> str | None:
         row = self.table.currentRow()
-        if 0 <= row < len(self._visible_ids):
-            return self._visible_ids[row]
+        if 0 <= row < len(self._row_entries):
+            entry_type, entry_id = self._row_entries[row]
+            if entry_type == "profile":
+                return entry_id
         return None
 
     def reload(self) -> None:
         selected_id = self.selected_id()
         query = self.search.text().strip().lower()
-        items = [
-            profile
-            for profile in self._profiles
-            if not query
-            or query in profile.name.lower()
-            or query in profile.address.lower()
-            or query in profile.protocol.lower()
-        ]
         sort_mode = self.sort_combo.currentText()
-        if sort_mode == "Имя":
-            items.sort(key=lambda item: item.name.lower())
-        elif sort_mode == "Пинг":
-            items.sort(key=lambda item: (item.latency_ms is None, item.latency_ms or 10**9, item.name.lower()))
+        rows = self._build_rows(query, sort_mode)
 
-        self._visible_ids = [item.id for item in items]
+        self._row_entries = [(row_type, row_id) for row_type, row_id, _profile in rows]
+        self._visible_ids = [row_id for row_type, row_id, _profile in rows if row_type == "profile"]
+        self._row_by_id = {
+            row_id: row
+            for row, (row_type, row_id, _profile) in enumerate(rows)
+            if row_type == "profile"
+        }
         self.table.setUpdatesEnabled(False)
         try:
+            if hasattr(self.table, "clearSpans"):
+                self.table.clearSpans()
             self.table.clearContents()
-            self.table.setRowCount(len(items))
-            for row, profile in enumerate(items):
+            self.table.setRowCount(len(rows))
+            for row, (row_type, row_id, profile) in enumerate(rows):
+                if row_type == "group":
+                    self._set_group_row(row, row_id)
+                    continue
+                if profile is None:
+                    continue
+                self.table.setRowHeight(row, self._profile_row_height())
                 values = [
                     profile.name,
                     profile.address,
@@ -593,15 +632,77 @@ class ServersPage(QWidget):
                 for col, value in enumerate(values):
                     table_item = QTableWidgetItem(value)
                     table_item.setData(Qt.ItemDataRole.UserRole, profile.id)
-                    if profile.id == getattr(self, "_active_id", None):
-                        table_item.setForeground(QColor(0, 120, 212))
                     self.table.setItem(row, col, table_item)
+                self._paint_row(row, profile.id == getattr(self, "_active_id", None))
             target_id = selected_id if selected_id in self._visible_ids else getattr(self, "_active_id", None)
-            if target_id in self._visible_ids:
-                self.table.selectRow(self._visible_ids.index(target_id))
+            target_row = self._row_by_id.get(target_id)
+            if target_row is not None:
+                self.table.selectRow(target_row)
         finally:
             self.table.setUpdatesEnabled(True)
             self.table.viewport().update()
+
+    def _build_rows(self, query: str, sort_mode: str) -> list[tuple[str, str, VlessProfile | None]]:
+        groups: dict[str, list[VlessProfile]] = {}
+        group_order: list[str] = []
+        for profile in self._profiles:
+            group_id = self._group_id(profile)
+            if group_id not in groups:
+                groups[group_id] = []
+                group_order.append(group_id)
+            groups[group_id].append(profile)
+
+        rows: list[tuple[str, str, VlessProfile | None]] = []
+        for group_id in group_order:
+            group_profiles = groups[group_id]
+            group_title = self._group_name(group_id)
+            if query:
+                if query in group_title.lower():
+                    items = list(group_profiles)
+                else:
+                    items = [
+                        profile
+                        for profile in group_profiles
+                        if query in profile.name.lower()
+                        or query in profile.address.lower()
+                        or query in profile.protocol.lower()
+                    ]
+            else:
+                items = list(group_profiles)
+            if not items:
+                continue
+            if sort_mode == "Имя":
+                items.sort(key=lambda item: item.name.lower())
+            elif sort_mode == "Пинг":
+                items.sort(key=lambda item: (item.latency_ms is None, item.latency_ms or 10**9, item.name.lower()))
+            rows.append(("group", group_id, None))
+            if query or group_id not in self._collapsed_groups:
+                rows.extend(("profile", profile.id, profile) for profile in items)
+        return rows
+
+    @staticmethod
+    def _group_id(profile: VlessProfile) -> str:
+        return profile.subscription_id or "__manual__"
+
+    def _group_name(self, group_id: str) -> str:
+        if group_id == "__manual__":
+            return "Без подписки"
+        return self._subscription_names.get(group_id) or "Подписка"
+
+    def _group_count(self, group_id: str) -> int:
+        return sum(1 for profile in self._profiles if self._group_id(profile) == group_id)
+
+    def _set_group_row(self, row: int, group_id: str) -> None:
+        collapsed = group_id in self._collapsed_groups and not self.search.text().strip()
+        arrow = "▸" if collapsed else "▾"
+        count = self._group_count(group_id)
+        item = QTableWidgetItem(f"{arrow}  {self._group_name(group_id)}  ·  {count} серверов")
+        item.setData(Qt.ItemDataRole.UserRole, group_id)
+        item.setForeground(QColor("#F2F2F2"))
+        item.setBackground(QColor("#303030"))
+        self.table.setItem(row, 0, item)
+        self.table.setSpan(row, 0, 1, self.table.columnCount())
+        self.table.setRowHeight(row, self._group_row_height())
 
     def _latency_label(self, profile: VlessProfile) -> str:
         if profile.latency_ms is not None:
@@ -610,8 +711,178 @@ class ServersPage(QWidget):
             return "timeout"
         return "--"
 
-    def _emit_activate(self) -> None:
-        self._emit_for_selected(self.activate_requested)
+    def _activate_pressed_cell(self, row: int, _column: int) -> None:
+        if not 0 <= row < len(self._row_entries):
+            return
+        entry_type, entry_id = self._row_entries[row]
+        if entry_type == "group":
+            self._toggle_group(entry_id)
+            return
+        self._focus_active_row_now(row, entry_id)
+        self.activate_requested.emit(entry_id)
+
+    def _toggle_group(self, group_id: str) -> None:
+        if self.search.text().strip():
+            self._toggle_group_immediate(group_id)
+            return
+        if group_id in self._collapsed_groups:
+            self._expand_group(group_id)
+        else:
+            self._collapse_group(group_id)
+
+    def _toggle_group_immediate(self, group_id: str) -> None:
+        if group_id in self._collapsed_groups:
+            self._collapsed_groups.remove(group_id)
+        else:
+            self._collapsed_groups.add(group_id)
+        self.reload()
+
+    def _collapse_group(self, group_id: str) -> None:
+        self._stop_group_animation()
+        rows = self._group_child_rows(group_id)
+        if not rows:
+            self._collapsed_groups.add(group_id)
+            self.reload()
+            return
+        self._set_group_collapsed_label(group_id, True)
+        self._animate_group_rows(
+            rows,
+            self._profile_row_height(),
+            0,
+            lambda: self._finish_group_collapse(group_id),
+        )
+
+    def _expand_group(self, group_id: str) -> None:
+        self._stop_group_animation()
+        self._collapsed_groups.remove(group_id)
+        self.reload()
+        rows = self._group_child_rows(group_id)
+        if not rows:
+            return
+        self._set_group_rows_height(rows, 0)
+        self._animate_group_rows(
+            rows,
+            0,
+            self._profile_row_height(),
+            lambda: self._finish_group_expand(rows),
+        )
+
+    def _finish_group_collapse(self, group_id: str) -> None:
+        self._group_animation = None
+        self._collapsed_groups.add(group_id)
+        self.reload()
+
+    def _finish_group_expand(self, rows: list[int]) -> None:
+        self._group_animation = None
+        self._set_group_rows_height(rows, self._profile_row_height())
+
+    def _group_row_index(self, group_id: str) -> int | None:
+        for row, (entry_type, entry_id) in enumerate(self._row_entries):
+            if entry_type == "group" and entry_id == group_id:
+                return row
+        return None
+
+    def _group_child_rows(self, group_id: str) -> list[int]:
+        group_row = self._group_row_index(group_id)
+        if group_row is None:
+            return []
+        rows: list[int] = []
+        for row in range(group_row + 1, len(self._row_entries)):
+            entry_type, entry_id = self._row_entries[row]
+            if entry_type == "group":
+                break
+            profile = self._profile_by_id.get(entry_id)
+            if profile and self._group_id(profile) == group_id:
+                rows.append(row)
+        return rows
+
+    def _set_group_collapsed_label(self, group_id: str, collapsed: bool) -> None:
+        row = self._group_row_index(group_id)
+        if row is None:
+            return
+        item = self.table.item(row, 0)
+        if item:
+            arrow = "▸" if collapsed else "▾"
+            item.setText(f"{arrow}  {self._group_name(group_id)}  ·  {self._group_count(group_id)} серверов")
+
+    def _animate_group_rows(
+        self,
+        rows: list[int],
+        start_height: int,
+        end_height: int,
+        on_finished: Callable[[], None],
+    ) -> None:
+        animation = QVariantAnimation(self)
+        animation.setDuration(190)
+        animation.setStartValue(start_height)
+        animation.setEndValue(end_height)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.valueChanged.connect(lambda value, rows=rows: self._set_group_rows_height(rows, int(value)))
+        animation.finished.connect(on_finished)
+        self._group_animation = animation
+        animation.start()
+
+    def _set_group_rows_height(self, rows: list[int], height: int) -> None:
+        value = max(0, int(height))
+        for row in rows:
+            if 0 <= row < self.table.rowCount():
+                self.table.setRowHeight(row, value)
+        self.table.viewport().update()
+
+    def _stop_group_animation(self) -> None:
+        if self._group_animation:
+            self._group_animation.stop()
+            self._group_animation = None
+
+    @staticmethod
+    def _profile_row_height() -> int:
+        return 34
+
+    @staticmethod
+    def _group_row_height() -> int:
+        return 36
+
+    def _focus_active_row_now(self, row: int, profile_id: str) -> None:
+        self.table.setFocus(Qt.FocusReason.MouseFocusReason)
+        self.table.setCurrentCell(row, 0)
+        self.table.selectRow(row)
+        self.set_active_id(profile_id)
+        self.table.viewport().repaint()
+
+    def _update_active_row(self, profile_id: str | None) -> None:
+        if not profile_id:
+            return
+        row = self._row_by_id.get(profile_id)
+        if row is None:
+            return
+        self._paint_row(row, profile_id == self._active_id)
+
+    def _paint_row(self, row: int, active: bool) -> None:
+        color = QColor(0, 120, 212) if active else QColor("#F2F2F2")
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row, col)
+            if item:
+                item.setForeground(color)
+        active_item = self.table.item(row, 5)
+        if active_item:
+            active_item.setText("Да" if active else "")
+
+    def update_latency_cells(self, profile_ids: list[str]) -> None:
+        if not profile_ids:
+            return
+        self.table.setUpdatesEnabled(False)
+        try:
+            for profile_id in profile_ids:
+                row = self._row_by_id.get(profile_id)
+                profile = self._profile_by_id.get(profile_id)
+                if row is None or profile is None:
+                    continue
+                item = self.table.item(row, 4)
+                if item:
+                    item.setText(self._latency_label(profile))
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self.table.viewport().update()
 
     def _emit_for_selected(self, signal) -> None:
         selected = self.selected_id()
@@ -623,6 +894,10 @@ class ServersPage(QWidget):
         self.ping_all_btn.setEnabled(not busy)
         self.sort_ping_btn.setEnabled(not busy)
         self.ping_all_btn.setText("Пинг выполняется..." if busy else "Пинг всех")
+
+    def set_latency_progress(self, completed: int, total: int) -> None:
+        if total > 0:
+            self.ping_all_btn.setText(f"Пинг {completed}/{total}")
 
 
 class SubscriptionsPage(QWidget):
@@ -1138,11 +1413,19 @@ class RazreshenieWindow(FluentWindow):
         self.settings.app_name = APP_NAME
         self.settings.portable_mode = paths.is_portable_mode()
         self.profiles = app_state.load_profiles()
+        self._profiles_by_id = {profile.id: profile for profile in self.profiles}
         self.subscriptions = app_state.load_subscriptions()
         self.split_rules = app_state.load_split_rules()
         self.rules_manager = RulesManager()
         self.subscription_manager = SubscriptionManager()
         self.singbox = SingBoxManager(self.logger)
+        self.latency_scanner = LatencyScanner(
+            timeout_ms=LATENCY_SCAN_TIMEOUT_MS,
+            max_workers=LATENCY_SCAN_WORKERS,
+            batch_size=LATENCY_BATCH_SIZE,
+            batch_interval_seconds=LATENCY_BATCH_INTERVAL_SECONDS,
+            logger=self.logger,
+        )
         self.traffic = TrafficMonitor()
         self.scheduler: RepeatingTask | None = None
         self._closing = False
@@ -1150,6 +1433,10 @@ class RazreshenieWindow(FluentWindow):
         self._ip_refreshing = False
         self._ping_refreshing = False
         self._latency_scan_running = False
+        self._latency_scan_total = 0
+        self._latency_scan_completed = 0
+        self._latency_result_queue: deque[tuple[str, int | None]] = deque()
+        self._pending_latency_summary: LatencyScanSummary | None = None
         self._core_version_cache: str | None = None
         self._last_ip_refresh = 0
         self._last_ping_refresh = 0
@@ -1181,6 +1468,9 @@ class RazreshenieWindow(FluentWindow):
         self.metrics_timer.setInterval(1000)
         self.metrics_timer.timeout.connect(self._status_loop)
         self.metrics_timer.start()
+        self.latency_result_timer = QTimer(self)
+        self.latency_result_timer.setInterval(LATENCY_UI_DRAIN_INTERVAL_MS)
+        self.latency_result_timer.timeout.connect(self._drain_latency_result_queue)
         self.activity_timer = QTimer(self)
         self.activity_timer.setInterval(3000)
         self.activity_timer.timeout.connect(self._refresh_activity_page)
@@ -1283,13 +1573,14 @@ class RazreshenieWindow(FluentWindow):
             self.connect_vpn()
 
     def _refresh_all_views(self) -> None:
+        self._rebuild_profile_index()
         active = self._active_profile()
         active_id = active.id if active else None
         self.dashboard_page.set_profiles(self.profiles, active_id)
         self.dashboard_page.set_mode(self.settings.mode)
         self.dashboard_page.set_connection(self.singbox.is_running(), self._busy)
         self.dashboard_page.set_rules_summary(self._rules_summary_line())
-        self.servers_page.set_profiles(self.profiles, active_id)
+        self.servers_page.set_profiles(self.profiles, active_id, self.subscriptions)
         self.subscriptions_page.set_subscriptions(self.subscriptions)
         self.routing_page.set_rules(self.split_rules, self._rules_summary_text())
         self.settings_page.set_values(self.settings)
@@ -1300,15 +1591,17 @@ class RazreshenieWindow(FluentWindow):
         self._refresh_tray_text()
 
     def _refresh_server_views(self) -> None:
+        self._rebuild_profile_index()
         active = self._active_profile()
         active_id = active.id if active else None
         self.dashboard_page.set_profiles(self.profiles, active_id)
-        self.servers_page.set_profiles(self.profiles, active_id)
+        self.servers_page.set_profiles(self.profiles, active_id, self.subscriptions)
 
     def _refresh_servers_table(self) -> None:
+        self._rebuild_profile_index()
         active = self._active_profile()
         active_id = active.id if active else None
-        self.servers_page.set_profiles(self.profiles, active_id)
+        self.servers_page.set_profiles(self.profiles, active_id, self.subscriptions)
 
     def _core_version(self, *, refresh: bool = False) -> str:
         if refresh or self._core_version_cache is None:
@@ -1317,13 +1610,20 @@ class RazreshenieWindow(FluentWindow):
 
     def _active_profile(self) -> VlessProfile | None:
         if self.settings.active_profile_id:
-            for profile in self.profiles:
-                if profile.id == self.settings.active_profile_id:
-                    return profile
+            profile = self._profiles_by_id.get(self.settings.active_profile_id)
+            if profile:
+                return profile
         return self.profiles[0] if self.profiles else None
 
+    def _rebuild_profile_index(self) -> None:
+        self._profiles_by_id = {profile.id: profile for profile in self.profiles}
+
     def _profile_by_id(self, profile_id: str) -> VlessProfile | None:
-        return next((profile for profile in self.profiles if profile.id == profile_id), None)
+        profile = self._profiles_by_id.get(profile_id)
+        if profile is None and self.profiles:
+            self._rebuild_profile_index()
+            profile = self._profiles_by_id.get(profile_id)
+        return profile
 
     def _subscription_by_id(self, subscription_id: str) -> Subscription | None:
         return next((item for item in self.subscriptions if item.id == subscription_id), None)
@@ -1332,10 +1632,17 @@ class RazreshenieWindow(FluentWindow):
         return next((item for item in self.split_rules.rule_sets if item.id == rule_set_id), None)
 
     def set_active_profile(self, profile_id: str) -> None:
-        if self._profile_by_id(profile_id):
-            self.settings.active_profile_id = profile_id
-            app_state.save_settings(self.settings)
-            self._refresh_all_views()
+        profile = self._profile_by_id(profile_id)
+        if not profile:
+            return
+        if self.settings.active_profile_id == profile_id:
+            return
+        self.settings.active_profile_id = profile_id
+        app_state.save_settings(self.settings)
+        self.dashboard_page.set_active_profile(profile)
+        self.servers_page.set_active_id(profile_id)
+        self.dashboard_page.set_connection(self.singbox.is_running(), self._busy)
+        self._refresh_tray_text()
 
     def set_mode(self, mode: str) -> None:
         previous_mode = self.settings.mode
@@ -1460,86 +1767,138 @@ class RazreshenieWindow(FluentWindow):
         profile = self._profile_by_id(profile_id)
         if not profile:
             return
-
-        def worker() -> int | None:
-            return measure_server_latency_ms(profile.address, profile.port, LATENCY_SCAN_TIMEOUT_MS)
-
-        self._run_background(worker, lambda latency: self._apply_single_latency_result(profile_id, latency), busy="Пинг сервера…")
+        self._start_latency_scan((profile,))
 
     def test_all_latencies(self) -> None:
-        if self._latency_scan_running:
+        self._start_latency_scan(self.profiles)
+
+    def _start_latency_scan(self, profiles: tuple[VlessProfile, ...] | list[VlessProfile]) -> None:
+        if self._latency_scan_running or self.latency_scanner.is_running:
             self._show_status("info", "Проверка отклика уже выполняется")
             return
-        if not self.profiles:
+        if not profiles:
             self._show_status("warning", "Сначала импортируйте серверы")
             return
-        snapshot = [(profile.id, profile.name, profile.address, profile.port) for profile in self.profiles]
+
+        total_profiles = len(profiles)
+        self._latency_result_queue.clear()
+        self._pending_latency_summary = None
         self._latency_scan_running = True
+        self._latency_scan_total = total_profiles
+        self._latency_scan_completed = 0
         self.servers_page.set_latency_busy(True)
+        self.servers_page.set_latency_progress(0, total_profiles)
 
-        def worker() -> tuple[int, int]:
-            ok = 0
-            batch: list[tuple[str, int | None]] = []
-            last_flush = time.monotonic()
+        def on_batch(results: list[tuple[str, int | None]]) -> None:
+            self.bridge.call.emit(lambda results=results: self._queue_latency_results(results))
 
-            def flush_batch(force: bool = False) -> None:
-                nonlocal batch, last_flush
-                if not batch:
-                    return
-                if not force and len(batch) < 12 and time.monotonic() - last_flush < 0.35:
-                    return
-                send_batch = batch
-                batch = []
-                last_flush = time.monotonic()
-                self.bridge.call.emit(lambda send_batch=send_batch: self._apply_latency_result_batch(send_batch))
+        def on_done(summary: LatencyScanSummary) -> None:
+            self.bridge.call.emit(lambda summary=summary: self._queue_latency_finish(summary))
 
-            with ThreadPoolExecutor(max_workers=min(LATENCY_SCAN_WORKERS, max(1, len(snapshot)))) as executor:
-                futures = {
-                    executor.submit(measure_server_latency_ms, address, port, LATENCY_SCAN_TIMEOUT_MS): (profile_id, name)
-                    for profile_id, name, address, port in snapshot
-                }
-                for future in as_completed(futures):
-                    profile_id, name = futures[future]
-                    try:
-                        latency = future.result()
-                    except Exception:
-                        latency = None
-                    self.logger.info("Отклик %s: %s", name, f"{latency} мс" if latency is not None else "таймаут")
-                    ok += int(latency is not None)
-                    batch.append((profile_id, latency))
-                    flush_batch()
-            flush_batch(force=True)
-            return len(snapshot), ok
+        def on_error(exc: Exception) -> None:
+            self.bridge.call.emit(lambda exc=exc: self._fail_latency_scan(exc))
 
-        self._run_background(worker, self._finish_latency_scan, busy=f"Пинг {len(snapshot)} серверов…")
+        started = self.latency_scanner.scan_profiles(
+            profiles,
+            on_batch=on_batch,
+            on_done=on_done,
+            on_error=on_error,
+        )
+        if not started:
+            self._latency_scan_running = False
+            self._latency_scan_total = 0
+            self._latency_scan_completed = 0
+            self._pending_latency_summary = None
+            self._latency_result_queue.clear()
+            self.servers_page.set_latency_busy(False)
+            self._show_status("info", "Проверка отклика уже выполняется")
 
-    def _apply_single_latency_result(self, profile_id: str, latency: int | None) -> None:
-        profile = self._set_profile_latency(profile_id, latency)
-        app_state.save_profiles(self.profiles)
-        self._refresh_servers_table()
-        if profile:
-            self._show_status("info", f"{profile.name}: {latency} мс" if latency is not None else f"{profile.name}: таймаут")
+    def _queue_latency_results(self, results: list[tuple[str, int | None]]) -> None:
+        self._latency_result_queue.extend(results)
+        if not self.latency_result_timer.isActive():
+            self.latency_result_timer.start()
+
+    def _queue_latency_finish(self, summary: LatencyScanSummary) -> None:
+        self._pending_latency_summary = summary
+        if not self.latency_result_timer.isActive():
+            self.latency_result_timer.start()
+
+    def _drain_latency_result_queue(self) -> None:
+        if not self._latency_result_queue:
+            self.latency_result_timer.stop()
+            if self._pending_latency_summary is not None:
+                summary = self._pending_latency_summary
+                self._pending_latency_summary = None
+                self._finish_latency_scan(summary)
+            return
+
+        batch: list[tuple[str, int | None]] = []
+        while self._latency_result_queue and len(batch) < LATENCY_UI_DRAIN_LIMIT:
+            batch.append(self._latency_result_queue.popleft())
+        self._apply_latency_result_batch(batch)
 
     def _apply_latency_result_batch(self, results: list[tuple[str, int | None]]) -> None:
+        changed_ids: list[str] = []
+        checked_at = utc_now_iso()
         for profile_id, latency in results:
-            self._set_profile_latency(profile_id, latency)
-        self._refresh_servers_table()
+            if self._set_profile_latency(profile_id, latency, checked_at):
+                changed_ids.append(profile_id)
+        self._latency_scan_completed = min(self._latency_scan_total, self._latency_scan_completed + len(results))
+        self.servers_page.update_latency_cells(changed_ids)
+        self.servers_page.set_latency_progress(self._latency_scan_completed, self._latency_scan_total)
 
-    def _finish_latency_scan(self, stats: tuple[int, int]) -> None:
-        total, ok = stats
+    def _finish_latency_scan(self, summary: LatencyScanSummary) -> None:
         self._latency_scan_running = False
+        self._latency_scan_total = 0
+        self._latency_scan_completed = 0
         self.servers_page.set_latency_busy(False)
-        app_state.save_profiles(self.profiles)
-        self._refresh_server_views()
-        self._show_status("success", f"Проверено: {total}, успешно: {ok}, таймаутов: {total - ok}")
+        self._save_profiles_background()
+        if summary.cancelled:
+            self._show_status("info", "Проверка отклика остановлена")
+            return
+        self._show_status(
+            "success",
+            (
+                f"Проверено: {summary.total_profiles}, успешно: {summary.successful_profiles}, "
+                f"таймаутов: {summary.timeout_profiles}"
+            ),
+        )
 
-    def _set_profile_latency(self, profile_id: str, latency: int | None) -> VlessProfile | None:
+    def _fail_latency_scan(self, exc: Exception) -> None:
+        self._latency_scan_running = False
+        self._latency_scan_total = 0
+        self._latency_scan_completed = 0
+        self._pending_latency_summary = None
+        self._latency_result_queue.clear()
+        if self.latency_result_timer.isActive():
+            self.latency_result_timer.stop()
+        self.servers_page.set_latency_busy(False)
+        self._show_status("error", f"Проверка отклика не удалась: {exc}")
+
+    def _set_profile_latency(
+        self,
+        profile_id: str,
+        latency: int | None,
+        checked_at: str | None = None,
+    ) -> VlessProfile | None:
         profile = self._profile_by_id(profile_id)
         if profile:
             profile.latency_ms = latency
-            profile.latency_checked_at = utc_now_iso()
-            profile.touch()
+            timestamp = checked_at or utc_now_iso()
+            profile.latency_checked_at = timestamp
+            profile.updated_at = timestamp
         return profile
+
+    def _save_profiles_background(self) -> None:
+        snapshot = list(self.profiles)
+
+        def worker() -> None:
+            try:
+                app_state.save_profiles(snapshot)
+            except Exception as exc:
+                self.logger.error("Не удалось сохранить профили после проверки отклика: %s", exc)
+
+        threading.Thread(target=worker, name="RazreshenieProfileSave", daemon=True).start()
 
     def sort_profiles_by_latency(self) -> None:
         self.profiles.sort(key=lambda item: (item.latency_ms is None, item.latency_ms or 10**9, item.name.lower()))
@@ -1577,7 +1936,7 @@ class RazreshenieWindow(FluentWindow):
         active_key = self.subscription_manager.profile_key(active_before) if active_before else None
         old_subscription_profiles = [profile for profile in self.profiles if profile.subscription_id == subscription.id]
         other_profiles = [profile for profile in self.profiles if profile.subscription_id != subscription.id]
-        merged_profiles, preserved_count = self._merge_subscription_profiles(old_subscription_profiles, profiles)
+        merged_profiles = self._merge_subscription_profiles(old_subscription_profiles, profiles)
         subscription.profile_count = len(merged_profiles)
         self.profiles = other_profiles + merged_profiles
         self.subscriptions = [subscription if item.id == subscription.id else item for item in self.subscriptions]
@@ -1589,15 +1948,16 @@ class RazreshenieWindow(FluentWindow):
         app_state.save_profiles(self.profiles)
         app_state.save_subscriptions(self.subscriptions)
         app_state.save_settings(self.settings)
-        self._refresh_all_views()
-        suffix = f" · сохранено старых: {preserved_count}" if preserved_count else ""
-        self._show_status("success", f"Подписка обновлена: {subscription.name} · серверов: {subscription.profile_count}{suffix}")
+        self._refresh_server_views()
+        self.subscriptions_page.set_subscriptions(self.subscriptions)
+        self._refresh_tray_text()
+        self._show_status("success", f"Подписка обновлена: {subscription.name} · серверов: {subscription.profile_count}")
 
     def _merge_subscription_profiles(
         self,
         existing_profiles: list[VlessProfile],
         incoming_profiles: list[VlessProfile],
-    ) -> tuple[list[VlessProfile], int]:
+    ) -> list[VlessProfile]:
         existing_by_key = {self.subscription_manager.profile_key(profile): profile for profile in existing_profiles}
         incoming_keys: set[str] = set()
         merged: list[VlessProfile] = []
@@ -1615,10 +1975,7 @@ class RazreshenieWindow(FluentWindow):
                 incoming.latency_checked_at = existing.latency_checked_at
             merged.append(incoming)
 
-        preserved = [profile for key, profile in existing_by_key.items() if key not in incoming_keys]
-        merged.extend(preserved)
-
-        return merged, len(preserved)
+        return merged
 
     def update_all_subscriptions(self) -> None:
         for subscription in list(self.subscriptions):
@@ -1818,9 +2175,12 @@ class RazreshenieWindow(FluentWindow):
             self.metrics_timer.stop()
         if self.activity_timer.isActive():
             self.activity_timer.stop()
+        if self.latency_result_timer.isActive():
+            self.latency_result_timer.stop()
         if self.scheduler:
             self.scheduler.stop()
             self.scheduler = None
+        self.latency_scanner.stop()
         if self.tray:
             self.tray.hide()
         self.hide()
@@ -2026,6 +2386,9 @@ class RazreshenieWindow(FluentWindow):
         if self.scheduler:
             self.scheduler.stop()
             self.scheduler = None
+        self.latency_scanner.stop()
+        if hasattr(self, "latency_result_timer") and self.latency_result_timer.isActive():
+            self.latency_result_timer.stop()
         try:
             self.singbox.stop()
             if self.settings.enable_system_proxy_guard:
