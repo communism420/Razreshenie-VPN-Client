@@ -28,8 +28,20 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
-from PyQt6.QtCore import QEasingCurve, QObject, QPointF, QRectF, QSize, Qt, QTimer, QVariantAnimation, pyqtSignal
-from PyQt6.QtGui import QAction, QCloseEvent, QColor, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtCore import (
+    QAbstractTableModel,
+    QEasingCurve,
+    QModelIndex,
+    QObject,
+    QPointF,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    QVariantAnimation,
+    pyqtSignal,
+)
+from PyQt6.QtGui import QAction, QBrush, QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -42,6 +54,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSystemTrayIcon,
+    QTableView,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -105,6 +118,7 @@ from utils.network import (
 from utils.scheduler import RepeatingTask
 from utils.version import (
     APP_NAME,
+    FLAG_ICONS_REPOSITORY,
     APP_REPOSITORY,
     APP_VERSION,
     RUSSIA_MOBILE_WHITELIST_REPOSITORY,
@@ -115,12 +129,142 @@ from utils.version import (
 ACCENT = "#0078D4"
 DANGER = "#D83B01"
 SUCCESS = "#16C60C"
+EMOJI_FONT_CANDIDATES = (
+    "Segoe UI Emoji",
+    "Segoe UI Symbol",
+    "Noto Color Emoji",
+    "Noto Emoji",
+    "Twemoji Mozilla",
+    "Apple Color Emoji",
+)
+_EMOJI_FONT_FAMILY: str | None = None
+_EMOJI_FONT_FAMILY_LOADED = False
+REGIONAL_INDICATOR_A = 0x1F1E6
+REGIONAL_INDICATOR_Z = 0x1F1FF
+FLAG_ICON_SIZE = QSize(24, 18)
+_FLAG_ICON_CACHE: dict[tuple[str, ...], QIcon] = {}
 LATENCY_SCAN_TIMEOUT_MS = 900
 LATENCY_SCAN_WORKERS = 32
 LATENCY_BATCH_SIZE = 48
 LATENCY_BATCH_INTERVAL_SECONDS = 0.25
 LATENCY_UI_DRAIN_INTERVAL_MS = 16
 LATENCY_UI_DRAIN_LIMIT = 24
+
+
+def _is_regional_indicator(char: str) -> bool:
+    return REGIONAL_INDICATOR_A <= ord(char) <= REGIONAL_INDICATOR_Z
+
+
+def _regional_pair_to_country_code(first: str, second: str) -> str:
+    return "".join(
+        chr(ord(char) - REGIONAL_INDICATOR_A + ord("a"))
+        for char in (first, second)
+    )
+
+
+def extract_flag_country_codes(text: str) -> tuple[tuple[str, ...], str]:
+    """Извлекает Unicode-флаги стран и возвращает ISO-коды плюс текст без этих пар."""
+    source = str(text or "")
+    codes: list[str] = []
+    clean_chars: list[str] = []
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if (
+            _is_regional_indicator(char)
+            and index + 1 < len(source)
+            and _is_regional_indicator(source[index + 1])
+        ):
+            codes.append(_regional_pair_to_country_code(char, source[index + 1]))
+            index += 2
+            continue
+        clean_chars.append(char)
+        index += 1
+    clean_text = " ".join("".join(clean_chars).split())
+    return tuple(codes), clean_text
+
+
+def flag_icon_path(country_code: str) -> Path:
+    return paths.resource_path("assets", "flags", "4x3", f"{country_code.lower()}.svg")
+
+
+def flag_icon(country_codes: tuple[str, ...]) -> QIcon | None:
+    existing_codes = tuple(
+        code.lower()
+        for code in country_codes[:3]
+        if len(code) == 2 and flag_icon_path(code).exists()
+    )
+    if not existing_codes:
+        return None
+    cached = _FLAG_ICON_CACHE.get(existing_codes)
+    if cached is not None:
+        return cached
+
+    icons = [QIcon(str(flag_icon_path(code))) for code in existing_codes]
+    icons = [icon for icon in icons if not icon.isNull()]
+    if not icons:
+        return None
+    if len(icons) == 1:
+        _FLAG_ICON_CACHE[existing_codes] = icons[0]
+        return icons[0]
+
+    width = FLAG_ICON_SIZE.width() * len(icons) + 2 * (len(icons) - 1)
+    height = FLAG_ICON_SIZE.height()
+    pixmap = QPixmap(width, height)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    try:
+        x = 0
+        for icon in icons:
+            painter.drawPixmap(x, 0, icon.pixmap(FLAG_ICON_SIZE))
+            x += FLAG_ICON_SIZE.width() + 2
+    finally:
+        painter.end()
+    composite = QIcon(pixmap)
+    _FLAG_ICON_CACHE[existing_codes] = composite
+    return composite
+
+
+def server_display_text_and_icon(name: str, fallback: str = "") -> tuple[str, QIcon | None]:
+    country_codes, clean_name = extract_flag_country_codes(name)
+    display_text = clean_name or str(fallback or name or "").strip() or "Сервер"
+    return display_text, flag_icon(country_codes)
+
+
+def server_label_html(text: str) -> str:
+    country_codes, clean_text = extract_flag_country_codes(text)
+    icon_paths = [flag_icon_path(code) for code in country_codes[:3] if flag_icon_path(code).exists()]
+    if not icon_paths:
+        return text
+    escaped_text = (
+        clean_text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+    images = " ".join(
+        f'<img src="{path.resolve().as_uri().replace("&", "&amp;")}" width="24" height="18">'
+        for path in icon_paths
+    )
+    return f"{images} {escaped_text}".strip()
+
+
+def emoji_font_family() -> str | None:
+    global _EMOJI_FONT_FAMILY, _EMOJI_FONT_FAMILY_LOADED
+    if _EMOJI_FONT_FAMILY_LOADED:
+        return _EMOJI_FONT_FAMILY
+    available = set(QFontDatabase.families())
+    _EMOJI_FONT_FAMILY = next((family for family in EMOJI_FONT_CANDIDATES if family in available), None)
+    _EMOJI_FONT_FAMILY_LOADED = True
+    return _EMOJI_FONT_FAMILY
+
+
+def install_emoji_font_fallbacks() -> None:
+    emoji_family = emoji_font_family()
+    if not emoji_family:
+        return
+    for base_family in ("Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Arial", "Sans Serif"):
+        QFont.insertSubstitutions(base_family, [emoji_family])
 
 
 def app_logo_icon() -> QIcon:
@@ -343,6 +487,7 @@ class DashboardPage(QWidget):
         self.connection_status = CaptionLabel("Core остановлен", self.connection_card)
         self.connection_status.setWordWrap(True)
         self.profile_combo = ComboBox(self.connection_card)
+        self.profile_combo.setIconSize(FLAG_ICON_SIZE)
         self.mode_combo = ComboBox(self.connection_card)
         self.mode_combo.addItem("Proxy", userData="proxy")
         self.mode_combo.addItem("TUN", userData="tun")
@@ -427,14 +572,16 @@ class DashboardPage(QWidget):
         self.profile_combo.clear()
         selected_index = 0
         for index, profile in enumerate(profiles):
-            self.profile_combo.addItem(f"{profile.name}  ({profile.address}:{profile.port})")
+            server_name, flag = server_display_text_and_icon(profile.name, profile.address)
+            combo_text = f"{server_name}  ({profile.address}:{profile.port})"
+            self.profile_combo.addItem(combo_text, icon=flag)
             self._profile_ids.append(profile.id)
             if active_id and profile.id == active_id:
                 selected_index = index
         if profiles:
             self.profile_combo.setEnabled(True)
             self.profile_combo.setCurrentIndex(selected_index)
-            self.connection_status.setText(profiles[selected_index].label)
+            self.connection_status.setText(server_label_html(profiles[selected_index].label))
         else:
             self.profile_combo.addItem("Нет профилей")
             self.profile_combo.setEnabled(False)
@@ -446,7 +593,7 @@ class DashboardPage(QWidget):
             self.profile_combo.blockSignals(True)
             self.profile_combo.setCurrentIndex(self._profile_ids.index(profile.id))
             self.profile_combo.blockSignals(False)
-        self.connection_status.setText(profile.label)
+        self.connection_status.setText(server_label_html(profile.label))
 
     def set_mode(self, mode: str) -> None:
         index = 1 if mode == "tun" else 0
@@ -566,6 +713,7 @@ class ServersPage(QWidget):
         self.table = TableWidget(self)
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(["Название", "Адрес", "Порт", "Тип", "Пинг", "Активен"])
+        self.table.setIconSize(FLAG_ICON_SIZE)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -645,8 +793,9 @@ class ServersPage(QWidget):
                 if profile is None:
                     continue
                 self.table.setRowHeight(row, self._profile_row_height())
+                display_name, flag = server_display_text_and_icon(profile.name, profile.address)
                 values = [
-                    profile.name,
+                    display_name,
                     profile.address,
                     str(profile.port),
                     profile.protocol.upper(),
@@ -655,6 +804,9 @@ class ServersPage(QWidget):
                 ]
                 for col, value in enumerate(values):
                     table_item = QTableWidgetItem(value)
+                    if col == 0:
+                        if flag:
+                            table_item.setIcon(flag)
                     table_item.setData(Qt.ItemDataRole.UserRole, profile.id)
                     self.table.setItem(row, col, table_item)
                 self._paint_row(row, profile.id == getattr(self, "_active_id", None))
@@ -720,7 +872,11 @@ class ServersPage(QWidget):
         collapsed = group_id in self._collapsed_groups and not self.search.text().strip()
         arrow = "▸" if collapsed else "▾"
         count = self._group_count(group_id)
-        item = QTableWidgetItem(f"{arrow}  {self._group_name(group_id)}  ·  {count} серверов")
+        group_name, flag = server_display_text_and_icon(self._group_name(group_id), self._group_name(group_id))
+        label = f"{arrow}  {group_name}  ·  {count} серверов"
+        item = QTableWidgetItem(label)
+        if flag:
+            item.setIcon(flag)
         item.setData(Qt.ItemDataRole.UserRole, group_id)
         item.setForeground(QColor("#F2F2F2"))
         item.setBackground(QColor("#303030"))
@@ -827,7 +983,11 @@ class ServersPage(QWidget):
         item = self.table.item(row, 0)
         if item:
             arrow = "▸" if collapsed else "▾"
-            item.setText(f"{arrow}  {self._group_name(group_id)}  ·  {self._group_count(group_id)} серверов")
+            group_name, flag = server_display_text_and_icon(self._group_name(group_id), self._group_name(group_id))
+            label = f"{arrow}  {group_name}  ·  {self._group_count(group_id)} серверов"
+            item.setText(label)
+            if flag:
+                item.setIcon(flag)
 
     def _animate_group_rows(
         self,
@@ -1171,6 +1331,80 @@ class LogsPage(QWidget):
         self.text.verticalScrollBar().setValue(self.text.verticalScrollBar().maximum())
 
 
+ACTIVITY_COLUMNS = ("Домен / поддомен", "Маршрут", "Правило", "Запросов", "Первый раз", "Последний раз")
+
+
+class DomainActivityTableModel(QAbstractTableModel):
+    """Легкая модель активности доменов без создания QWidget-элементов на каждую строку."""
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._rows: list[tuple[str, str, str, str, str, str]] = []
+        self._routes: list[str] = []
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(ACTIVITY_COLUMNS)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
+        if not index.isValid():
+            return None
+        row = index.row()
+        column = index.column()
+        if row < 0 or row >= len(self._rows) or column < 0 or column >= len(ACTIVITY_COLUMNS):
+            return None
+
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self._rows[row][column]
+        if role == Qt.ItemDataRole.ForegroundRole:
+            route = self._routes[row]
+            if route == ROUTE_OUTBOUND_PROXY:
+                return QBrush(QColor(0, 180, 255))
+            if route == ROUTE_OUTBOUND_DIRECT:
+                return QBrush(QColor(0, 220, 120))
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if column == 3:
+                return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            return Qt.AlignmentFlag.AlignVCenter
+        return None
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal and 0 <= section < len(ACTIVITY_COLUMNS):
+            return ACTIVITY_COLUMNS[section]
+        return None
+
+    def set_entries(self, entries: list[DomainActivityEntry]) -> bool:
+        rows = [
+            (
+                entry.domain,
+                entry.route_label,
+                entry.rule_name,
+                str(entry.hits),
+                entry.first_seen_label,
+                entry.last_seen_label,
+            )
+            for entry in entries
+        ]
+        routes = [entry.route for entry in entries]
+        if rows == self._rows and routes == self._routes:
+            return False
+
+        self.beginResetModel()
+        self._rows = rows
+        self._routes = routes
+        self.endResetModel()
+        return True
+
+
 class DomainActivityPage(QWidget):
     filters_changed = pyqtSignal()
     clear_requested = pyqtSignal()
@@ -1202,13 +1436,20 @@ class DomainActivityPage(QWidget):
         toolbar.addWidget(self.clear_btn)
         root.addLayout(toolbar)
 
-        self.table = TableWidget(self)
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["Домен / поддомен", "Маршрут", "Правило", "Запросов", "Первый раз", "Последний раз"])
+        self.activity_model = DomainActivityTableModel(self)
+        self.table = QTableView(self)
+        self.table.setModel(self.activity_model)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.table.setWordWrap(False)
+        self.table.setShowGrid(False)
+        self.table.setSortingEnabled(False)
+        self.table.verticalHeader().setDefaultSectionSize(30)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         for col in (1, 3, 4, 5):
@@ -1226,24 +1467,16 @@ class DomainActivityPage(QWidget):
         return str(self.route_combo.currentData() or "all")
 
     def set_entries(self, entries: list[DomainActivityEntry]) -> None:
-        self.table.setRowCount(len(entries))
-        for row, entry in enumerate(entries):
-            values = [
-                entry.domain,
-                entry.route_label,
-                entry.rule_name,
-                str(entry.hits),
-                entry.first_seen_label,
-                entry.last_seen_label,
-            ]
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if entry.route == ROUTE_OUTBOUND_PROXY:
-                    item.setForeground(QColor(0, 180, 255))
-                elif entry.route == ROUTE_OUTBOUND_DIRECT:
-                    item.setForeground(QColor(0, 220, 120))
-                self.table.setItem(row, col, item)
-        self.table.resizeRowsToContents()
+        scroll_bar = self.table.verticalScrollBar()
+        previous_scroll = scroll_bar.value()
+        changed = self.activity_model.set_entries(entries)
+        if changed and previous_scroll > 0:
+            QTimer.singleShot(
+                0,
+                lambda value=previous_scroll: self.table.verticalScrollBar().setValue(
+                    min(value, self.table.verticalScrollBar().maximum())
+                ),
+            )
 
 
 class SettingsPage(QWidget):
@@ -1393,7 +1626,8 @@ class AboutPage(QWidget):
             "Часть кода, графической архитектуры и дизайн-подходов адаптированы из open-source проекта "
             f"zapret-kvn: {ZAPRET_KVN_REPOSITORY}\n\n"
             "Спасибо проекту russia-mobile-internet-whitelist за домены из российского "
-            f"\"белого списка\" для встроенного bypass: {RUSSIA_MOBILE_WHITELIST_REPOSITORY}",
+            f"\"белого списка\" для встроенного bypass: {RUSSIA_MOBILE_WHITELIST_REPOSITORY}\n\n"
+            f"SVG-флаги стран предоставлены проектом flag-icons под лицензией MIT: {FLAG_ICONS_REPOSITORY}",
             card,
         )
         text.setWordWrap(True)
@@ -1402,6 +1636,7 @@ class AboutPage(QWidget):
         self.github_btn = PrimaryPushButton(FIF.LINK, "Открыть GitHub", card)
         self.zapret_btn = PushButton(FIF.LINK, "Открыть zapret-kvn", card)
         self.whitelist_btn = PushButton(FIF.LINK, "Открыть whitelist", card)
+        self.flags_btn = PushButton(FIF.LINK, "Открыть flag-icons", card)
         layout.addLayout(header)
         layout.addSpacing(8)
         layout.addWidget(text)
@@ -1411,6 +1646,7 @@ class AboutPage(QWidget):
         buttons.addWidget(self.github_btn)
         buttons.addWidget(self.zapret_btn)
         buttons.addWidget(self.whitelist_btn)
+        buttons.addWidget(self.flags_btn)
         buttons.addStretch(1)
         layout.addLayout(buttons)
         root.addWidget(card)
@@ -1418,6 +1654,7 @@ class AboutPage(QWidget):
         self.github_btn.clicked.connect(lambda: webbrowser.open(APP_REPOSITORY))
         self.zapret_btn.clicked.connect(lambda: webbrowser.open(ZAPRET_KVN_REPOSITORY))
         self.whitelist_btn.clicked.connect(lambda: webbrowser.open(RUSSIA_MOBILE_WHITELIST_REPOSITORY))
+        self.flags_btn.clicked.connect(lambda: webbrowser.open(FLAG_ICONS_REPOSITORY))
 
     def set_core_version(self, version: str) -> None:
         self.core_label.setText(f"Core: {version}")
@@ -1430,7 +1667,7 @@ class RazreshenieWindow(FluentWindow):
         self.bridge = UiBridge(self)
         self.bridge.call.connect(lambda callback: callback())
         self.bridge.log_line.connect(self._append_log_line)
-        self.bridge.activity_changed.connect(self._refresh_activity_page)
+        self.bridge.activity_changed.connect(self._schedule_activity_refresh)
         self.log_buffer = LogBuffer()
         self.domain_activity = DomainActivityTracker()
         self.logger = setup_logger(paths.log_file_path(), self._on_log_from_thread)
@@ -1469,6 +1706,8 @@ class RazreshenieWindow(FluentWindow):
         self._ip_label = "IP: —"
         self._ping_label = "Пинг: —"
         self._speed_label = "↓ 0.0 Б/с   ↑ 0.0 Б/с"
+        self._activity_signal_lock = threading.Lock()
+        self._activity_signal_pending = False
         self.tray: QSystemTrayIcon | None = None
 
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
@@ -1487,6 +1726,10 @@ class RazreshenieWindow(FluentWindow):
         self._create_navigation()
         self._create_tray()
         self._connect_signals()
+        self.activity_refresh_timer = QTimer(self)
+        self.activity_refresh_timer.setSingleShot(True)
+        self.activity_refresh_timer.setInterval(180)
+        self.activity_refresh_timer.timeout.connect(self._refresh_activity_page)
         self._refresh_all_views()
         self._start_subscription_scheduler()
 
@@ -1499,7 +1742,7 @@ class RazreshenieWindow(FluentWindow):
         self.latency_result_timer.timeout.connect(self._drain_latency_result_queue)
         self.activity_timer = QTimer(self)
         self.activity_timer.setInterval(3000)
-        self.activity_timer.timeout.connect(self._refresh_activity_page)
+        self.activity_timer.timeout.connect(lambda: self._schedule_activity_refresh(0))
         self.activity_timer.start()
         QTimer.singleShot(250, self._post_init)
 
@@ -1571,7 +1814,7 @@ class RazreshenieWindow(FluentWindow):
 
         self.logs_page.clear_requested.connect(self.clear_log_window)
         self.logs_page.export_requested.connect(self.export_logs)
-        self.activity_page.filters_changed.connect(self._refresh_activity_page)
+        self.activity_page.filters_changed.connect(lambda: self._schedule_activity_refresh(120))
         self.activity_page.clear_requested.connect(self.clear_domain_activity)
         self.settings_page.save_requested.connect(self.save_settings)
         self.settings_page.reset_requested.connect(self.reset_all_app_data)
@@ -2228,6 +2471,8 @@ class RazreshenieWindow(FluentWindow):
             self.metrics_timer.stop()
         if self.activity_timer.isActive():
             self.activity_timer.stop()
+        if self.activity_refresh_timer.isActive():
+            self.activity_refresh_timer.stop()
         if self.latency_result_timer.isActive():
             self.latency_result_timer.stop()
         if self.scheduler:
@@ -2393,11 +2638,28 @@ class RazreshenieWindow(FluentWindow):
     def _on_log_from_thread(self, level: str, message: str) -> None:
         self.log_buffer.append(level, message)
         if self.domain_activity.ingest_log_line(message, self.split_rules):
-            self.bridge.activity_changed.emit()
+            should_emit = False
+            with self._activity_signal_lock:
+                if not self._activity_signal_pending:
+                    self._activity_signal_pending = True
+                    should_emit = True
+            if should_emit:
+                self.bridge.activity_changed.emit()
         self.bridge.log_line.emit(level, message)
 
     def _append_log_line(self, _level: str, message: str) -> None:
         self.logs_page.append_line(message)
+
+    def _schedule_activity_refresh(self, delay_ms: int = 180) -> None:
+        if self._closing:
+            return
+        if delay_ms <= 0:
+            if self.activity_refresh_timer.isActive():
+                self.activity_refresh_timer.stop()
+            self._refresh_activity_page()
+            return
+        if not self.activity_refresh_timer.isActive():
+            self.activity_refresh_timer.start(delay_ms)
 
     def _refresh_activity_page(self) -> None:
         entries = self.domain_activity.snapshot(
@@ -2405,6 +2667,8 @@ class RazreshenieWindow(FluentWindow):
             self.activity_page.route_filter(),
         )
         self.activity_page.set_entries(entries)
+        with self._activity_signal_lock:
+            self._activity_signal_pending = False
 
     def _refresh_tray_text(self) -> None:
         if not self.tray:
@@ -2450,6 +2714,8 @@ class RazreshenieWindow(FluentWindow):
         self.latency_scanner.stop()
         if hasattr(self, "latency_result_timer") and self.latency_result_timer.isActive():
             self.latency_result_timer.stop()
+        if hasattr(self, "activity_refresh_timer") and self.activity_refresh_timer.isActive():
+            self.activity_refresh_timer.stop()
         try:
             self.singbox.stop()
             if self.settings.enable_system_proxy_guard:
@@ -2474,6 +2740,7 @@ class RazreshenieApp:
         self.qt_app = QApplication.instance() or QApplication(sys.argv)
         self.qt_app.setApplicationName(APP_NAME)
         self.qt_app.setApplicationVersion(APP_VERSION)
+        install_emoji_font_fallbacks()
         setTheme(Theme.DARK)
         setThemeColor(ACCENT)
         self.window = RazreshenieWindow()

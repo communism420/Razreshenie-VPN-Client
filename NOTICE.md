@@ -1,6 +1,6 @@
 # NOTICE
 
-Razreshenie VPN Client version 1.1.2.
+Razreshenie VPN Client version 1.1.3.
 
 Razreshenie VPN Client is distributed under GPLv3.
 
@@ -13,3 +13,7 @@ The local reference copy of zapret-kvn identifies the project license as MIT in 
 Razreshenie VPN Client thanks the russia-mobile-internet-whitelist project for domains from the Russian whitelist used by the built-in bypass:
 
 <https://github.com/hxehex/russia-mobile-internet-whitelist>
+
+Country flag SVG assets are provided by flag-icons under the MIT License:
+
+<https://github.com/lipis/flag-icons>
