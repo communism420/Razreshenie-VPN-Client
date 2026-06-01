@@ -143,28 +143,59 @@ def format_speed(bytes_per_second: float) -> str:
     return f"{value:.1f} {units[unit_index]}"
 
 
+def format_bytes(byte_count: float) -> str:
+    units = ("Б", "КБ", "МБ", "ГБ", "ТБ")
+    value = float(max(0.0, byte_count))
+    unit_index = 0
+    while value >= 1024 and unit_index < len(units) - 1:
+        value /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(value)} {units[unit_index]}"
+    return f"{value:.1f} {units[unit_index]}"
+
+
 @dataclass
 class TrafficSample:
     download: float = 0.0
     upload: float = 0.0
+    total_download: float = 0.0
+    total_upload: float = 0.0
 
 
 class TrafficMonitor:
-    """Считает общую скорость по системным сетевым счетчикам."""
+    """Считает скорость и общий объем трафика по системным сетевым счетчикам."""
 
     def __init__(self) -> None:
+        self._total_recv = 0.0
+        self._total_sent = 0.0
+        self.reset()
+
+    def reset(self) -> None:
         counters = psutil.net_io_counters()
         self._last_recv = counters.bytes_recv
         self._last_sent = counters.bytes_sent
         self._last_time = time.monotonic()
+        self._total_recv = 0.0
+        self._total_sent = 0.0
 
-    def sample(self) -> TrafficSample:
+    def sample(self, active: bool = True) -> TrafficSample:
         counters = psutil.net_io_counters()
         now = time.monotonic()
         elapsed = max(0.001, now - self._last_time)
-        download = (counters.bytes_recv - self._last_recv) / elapsed
-        upload = (counters.bytes_sent - self._last_sent) / elapsed
+        recv_delta = max(0, counters.bytes_recv - self._last_recv)
+        sent_delta = max(0, counters.bytes_sent - self._last_sent)
         self._last_recv = counters.bytes_recv
         self._last_sent = counters.bytes_sent
         self._last_time = now
-        return TrafficSample(download=download, upload=upload)
+        if not active:
+            return TrafficSample(total_download=self._total_recv, total_upload=self._total_sent)
+
+        self._total_recv += recv_delta
+        self._total_sent += sent_delta
+        return TrafficSample(
+            download=recv_delta / elapsed,
+            upload=sent_delta / elapsed,
+            total_download=self._total_recv,
+            total_upload=self._total_sent,
+        )

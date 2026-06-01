@@ -97,6 +97,7 @@ from utils.app_logger import LogBuffer, setup_logger
 from utils.network import (
     TrafficMonitor,
     check_dns_resolver,
+    format_bytes,
     format_speed,
     get_public_ip,
     measure_server_latency_ms,
@@ -371,6 +372,18 @@ class DashboardPage(QWidget):
         routing_layout.addWidget(self.open_rules_btn)
         cards.addWidget(self.routing_card, 1)
 
+        self.total_traffic_card = CardWidget(container)
+        total_traffic_layout = QVBoxLayout(self.total_traffic_card)
+        total_traffic_layout.setContentsMargins(18, 16, 18, 16)
+        total_traffic_layout.setSpacing(8)
+        total_traffic_layout.addWidget(StrongBodyLabel("Общий трафик", self.total_traffic_card))
+        self.total_download_label = BodyLabel("↓ Прибыло: 0 Б", self.total_traffic_card)
+        self.total_upload_label = BodyLabel("↑ Отправлено: 0 Б", self.total_traffic_card)
+        total_traffic_layout.addWidget(self.total_download_label)
+        total_traffic_layout.addWidget(self.total_upload_label)
+        total_traffic_layout.addStretch(1)
+        cards.addWidget(self.total_traffic_card, 1)
+
         self.traffic_card = CardWidget(container)
         traffic_layout = QVBoxLayout(self.traffic_card)
         traffic_layout.setContentsMargins(18, 16, 18, 16)
@@ -460,10 +473,21 @@ class DashboardPage(QWidget):
             self.toggle_btn.setText("Подключить")
             self.toggle_btn.setIcon(FIF.PLAY_SOLID)
 
-    def set_metrics(self, ip: str, ping: str, speed: str, down_bps: float, up_bps: float) -> None:
+    def set_metrics(
+        self,
+        ip: str,
+        ping: str,
+        speed: str,
+        down_bps: float,
+        up_bps: float,
+        total_down: str,
+        total_up: str,
+    ) -> None:
         self.ip_label.setText(ip)
         self.ping_label.setText(ping)
         self.speed_label.setText(speed)
+        self.total_download_label.setText(f"↓ Прибыло: {total_down}")
+        self.total_upload_label.setText(f"↑ Отправлено: {total_up}")
         self.graph.add_point(down_bps, up_bps)
 
     def set_rules_summary(self, text: str) -> None:
@@ -1717,6 +1741,8 @@ class RazreshenieWindow(FluentWindow):
 
     def _connected_ui(self, profile: VlessProfile) -> None:
         self.dashboard_page.set_connection(True)
+        self.traffic.reset()
+        self.dashboard_page.clear_graph()
         self._refresh_tray_text()
         self._show_status("success", f"Подключено: {profile.name}")
         if self.settings.show_notifications:
@@ -2218,7 +2244,7 @@ class RazreshenieWindow(FluentWindow):
         running = self.singbox.is_running()
         if not running and self.dashboard_page.connection_state.text() == "Подключено":
             self.dashboard_page.set_connection(False)
-        sample = self.traffic.sample()
+        sample = self.traffic.sample(active=running)
         self._speed_label = f"↓ {format_speed(sample.download)}   ↑ {format_speed(sample.upload)}"
         now = int(time.time())
         if now - self._last_ip_refresh > 30 and not self._ip_refreshing:
@@ -2246,7 +2272,15 @@ class RazreshenieWindow(FluentWindow):
                     self._ping_refreshing = False
 
                 self._run_background(ping_worker, ping_done, set_busy=False)
-        self.dashboard_page.set_metrics(self._ip_label, self._ping_label, self._speed_label, sample.download, sample.upload)
+        self.dashboard_page.set_metrics(
+            self._ip_label,
+            self._ping_label,
+            self._speed_label,
+            sample.download,
+            sample.upload,
+            format_bytes(sample.total_download),
+            format_bytes(sample.total_upload),
+        )
 
     def _set_ip(self, text: str) -> None:
         self._ip_label = text
