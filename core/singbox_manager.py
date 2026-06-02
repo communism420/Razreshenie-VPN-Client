@@ -22,6 +22,7 @@ import hashlib
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -54,7 +55,7 @@ class SingBoxManager:
         self._lock = threading.RLock()
         self._output_lock = threading.RLock()
         self._reader_thread: threading.Thread | None = None
-        self._last_output_lines: deque[str] = deque(maxlen=40)
+        self._last_output_lines: deque[str] = deque(maxlen=120)
         self._active_tun_interface: str | None = None
 
     @staticmethod
@@ -184,6 +185,10 @@ class SingBoxManager:
             if self.is_running():
                 return
             exe = self.ensure_binary()
+            self._preflight_profile(profile)
+            self._kill_orphaned(exe)
+            if settings.mode == "proxy":
+                self._ensure_proxy_port_free(settings.mixed_listen_host, int(settings.mixed_port))
             config_path = self.build_and_save_config(profile, settings, split_rules)
             ok, output = self.check_config(config_path)
             if not ok:
@@ -197,14 +202,15 @@ class SingBoxManager:
                         f"{names}. Закройте Karing или другой VPN-клиент и подключитесь заново, "
                         "иначе Windows будет использовать чужой DNS, а раздельное туннелирование не сработает."
                     )
-            self._kill_orphaned(exe)
-            if settings.mode == "tun":
-                self._clear_runtime_cache(exe)
-                self._flush_windows_dns_cache()
 
-            attempts = 3 if settings.mode == "tun" else 1
+            attempts = 3 if settings.mode == "tun" else 2
             last_error = ""
             for attempt in range(1, attempts + 1):
+                if settings.mode == "tun":
+                    self._clear_runtime_cache(exe)
+                    self._flush_windows_dns_cache()
+                elif attempt > 1:
+                    self._ensure_proxy_port_free(settings.mixed_listen_host, int(settings.mixed_port))
                 self._clear_last_output()
                 self.logger.info("Запуск sing-box: %s (попытка %s/%s)", config_path, attempt, attempts)
                 self._active_tun_interface = settings.tun_interface_name if settings.mode == "tun" else None
@@ -212,22 +218,32 @@ class SingBoxManager:
                     [str(exe), "run", "-c", str(config_path), "-D", str(exe.parent)],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
                     cwd=str(exe.parent),
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    bufsize=1,
                     **self._no_window_kwargs(),
                 )
                 self._reader_thread = threading.Thread(target=self._read_process_logs, daemon=True)
                 self._reader_thread.start()
 
                 if settings.mode != "tun":
-                    self._wait_for_proxy_startup()
-                    if self.is_running():
+                    if self._wait_until_proxy_ready(settings.mixed_listen_host, int(settings.mixed_port)):
                         return
-                    raise SingBoxError(self._unexpected_exit_message(startup=True))
+                    exited = self.process is None or self.process.poll() is not None
+                    last_error = self._unexpected_exit_message(startup=True) if exited else (
+                        "sing-box запустился, но локальный proxy-порт "
+                        f"{settings.mixed_listen_host}:{settings.mixed_port} не принимает подключения"
+                    )
+                    self._stop_process_locked()
+                    if attempt < attempts:
+                        time.sleep(0.35)
+                        continue
+                    break
 
-                if self._wait_until_tun_ready(settings.tun_interface_name):
+                if self._wait_until_tun_ready(settings.tun_interface_name) and self._wait_process_stable():
                     return
 
                 exited = self.process is None or self.process.poll() is not None
@@ -289,14 +305,28 @@ class SingBoxManager:
         with self._output_lock:
             return list(self._last_output_lines)
 
-    def _wait_for_proxy_startup(self, max_wait: float = 1.2) -> None:
+    def _wait_until_proxy_ready(self, host: str, port: int, max_wait: float = 8.0) -> bool:
+        connect_host = self._connect_host(host)
         deadline = time.monotonic() + max_wait
         while time.monotonic() < deadline:
             if not self.process or self.process.poll() is not None:
-                return
-            time.sleep(0.05)
+                return False
+            try:
+                with socket.create_connection((connect_host, int(port)), timeout=0.35):
+                    return self._wait_process_stable(max_wait=0.35)
+            except OSError:
+                time.sleep(0.08)
+        return False
 
-    def _wait_until_tun_ready(self, tun_interface_name: str, max_wait: float = 18.0) -> bool:
+    def _wait_process_stable(self, max_wait: float = 0.7) -> bool:
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
+            if not self.process or self.process.poll() is not None:
+                return False
+            time.sleep(0.05)
+        return self.is_running()
+
+    def _wait_until_tun_ready(self, tun_interface_name: str, max_wait: float = 24.0) -> bool:
         if os.name != "nt" or not tun_interface_name:
             return self.is_running()
         deadline = time.monotonic() + max_wait
@@ -307,6 +337,39 @@ class SingBoxManager:
                 return True
             time.sleep(0.25)
         return False
+
+    @staticmethod
+    def _connect_host(host: str) -> str:
+        value = str(host or "").strip()
+        if value in {"", "0.0.0.0", "::", "[::]"}:
+            return "127.0.0.1"
+        return value.strip("[]")
+
+    def _ensure_proxy_port_free(self, host: str, port: int) -> None:
+        connect_host = self._connect_host(host)
+        try:
+            with socket.create_connection((connect_host, int(port)), timeout=0.25):
+                raise SingBoxError(
+                    f"Локальный proxy-порт {connect_host}:{port} уже занят. "
+                    "Закройте приложение, которое использует этот порт, или измените порт в настройках."
+                )
+        except SingBoxError:
+            raise
+        except OSError:
+            return
+
+    @staticmethod
+    def _preflight_profile(profile: VlessProfile) -> None:
+        if not str(profile.address or "").strip():
+            raise SingBoxError("У выбранного профиля не указан адрес сервера")
+        try:
+            port = int(profile.port)
+        except (TypeError, ValueError) as exc:
+            raise SingBoxError("У выбранного профиля указан некорректный порт") from exc
+        if port <= 0 or port > 65535:
+            raise SingBoxError("У выбранного профиля порт вне диапазона 1-65535")
+        if not str(profile.uuid or "").strip():
+            raise SingBoxError("У выбранного профиля не указан UUID")
 
     @staticmethod
     def _tun_interface_has_ipv4(tun_interface_name: str) -> bool:
@@ -436,6 +499,16 @@ class SingBoxManager:
             "already exists",
             "cannot create a file when that file already exists",
             "adapter already exists",
+            "device or resource busy",
+            "resource busy",
+            "wintun",
+            "tun device",
+            "failed to configure tun",
+            "failed to start tun",
+            "route already exists",
+            "object already exists",
+            "access is denied",
+            "permission denied",
         )
         for line in self._last_output():
             text = line.lower()
@@ -447,7 +520,8 @@ class SingBoxManager:
         stage = "при запуске" if startup else "во время работы"
         lines = self._last_output()
         if lines:
-            return f"sing-box завершился {stage}: {lines[-1]}"
+            tail = "\n".join(lines[-6:])
+            return f"sing-box завершился {stage}:\n{tail}"
         if self.process and self.process.returncode is not None:
             return f"sing-box завершился {stage} с кодом {self.process.returncode}"
         return f"sing-box завершился {stage}"

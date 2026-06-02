@@ -41,7 +41,20 @@ from PyQt6.QtCore import (
     QVariantAnimation,
     pyqtSignal,
 )
-from PyQt6.QtGui import QAction, QBrush, QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtGui import (
+    QAction,
+    QBrush,
+    QCloseEvent,
+    QColor,
+    QFont,
+    QFontDatabase,
+    QIcon,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -311,20 +324,85 @@ class TrafficGraphWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None, max_points: int = 80) -> None:
         super().__init__(parent)
-        self._down: deque[float] = deque(maxlen=max_points)
-        self._up: deque[float] = deque(maxlen=max_points)
+        self._down: deque[float] = deque(maxlen=max_points + 1)
+        self._up: deque[float] = deque(maxlen=max_points + 1)
         self._max_points = max_points
+        self._scroll_progress = 0.0
+        self._display_scale = 100.0
+        self._target_scale = 100.0
+        self._animation_started = 0.0
+        self._animation_duration = 0.92
+        self._easing = QEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._animation_timer = QTimer(self)
+        self._animation_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._animation_timer.setInterval(16)
+        self._animation_timer.timeout.connect(self._animation_step)
         self.setMinimumHeight(120)
 
     def add_point(self, down_bps: float, up_bps: float) -> None:
+        if self._animation_timer.isActive():
+            self._finish_scroll()
         self._down.append(max(0.0, down_bps))
         self._up.append(max(0.0, up_bps))
+        self._target_scale = self._calculate_scale(self._scroll_series(self._down), self._scroll_series(self._up))
+        if self._target_scale > self._display_scale:
+            self._display_scale = self._target_scale
+        self._scroll_progress = 0.0
+        self._animation_started = time.monotonic()
+        if not self._animation_timer.isActive():
+            self._animation_timer.start()
         self.update()
 
     def clear_data(self) -> None:
         self._down.clear()
         self._up.clear()
+        self._scroll_progress = 0.0
+        self._display_scale = 100.0
+        self._target_scale = 100.0
+        self._animation_timer.stop()
         self.update()
+
+    @staticmethod
+    def _calculate_scale(down_values: list[float], up_values: list[float]) -> float:
+        return max(max(down_values + up_values, default=1.0), 100.0) * 1.18
+
+    def _scroll_series(self, values: deque[float]) -> list[float]:
+        items = list(values)
+        required = self._max_points + 1
+        if len(items) >= required:
+            return items[-required:]
+        return [0.0] * (required - len(items)) + items
+
+    def _stable_series(self, values: deque[float]) -> list[float]:
+        items = list(values)
+        if len(items) >= self._max_points:
+            return items[-self._max_points :]
+        return [0.0] * (self._max_points - len(items)) + items
+
+    def _animation_step(self) -> None:
+        if self._apply_animation_progress(time.monotonic()):
+            self.update()
+            return
+        self._animation_timer.stop()
+        self._finish_scroll(update=False)
+        self.update()
+
+    def _apply_animation_progress(self, now: float) -> bool:
+        elapsed = max(0.0, now - self._animation_started)
+        progress = min(1.0, elapsed / self._animation_duration) if self._animation_duration > 0 else 1.0
+        self._scroll_progress = float(self._easing.valueForProgress(progress))
+        if self._target_scale < self._display_scale:
+            self._display_scale += (self._target_scale - self._display_scale) * 0.025
+        return progress < 1.0
+
+    def _finish_scroll(self, update: bool = True) -> None:
+        self._animation_timer.stop()
+        self._down = deque(list(self._down)[-self._max_points :], maxlen=self._max_points + 1)
+        self._up = deque(list(self._up)[-self._max_points :], maxlen=self._max_points + 1)
+        self._scroll_progress = 0.0
+        self._target_scale = self._calculate_scale(self._stable_series(self._down), self._stable_series(self._up))
+        if update:
+            self.update()
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
@@ -346,37 +424,100 @@ class TrafficGraphWidget(QWidget):
             y = graph_y + graph_h * index / 3
             painter.drawLine(QPointF(graph_x, y), QPointF(graph_x + graph_w, y))
 
-        all_values = list(self._down) + list(self._up)
-        scale = max(max(all_values, default=1.0), 100.0) * 1.15
-        self._draw_series(painter, self._down, QColor(0, 180, 255), graph_x, graph_y, graph_w, graph_h, scale)
-        self._draw_series(painter, self._up, QColor(0, 220, 120), graph_x, graph_y, graph_w, graph_h, scale)
+        is_scrolling = self._animation_timer.isActive()
+        down_values = self._scroll_series(self._down) if is_scrolling else self._stable_series(self._down)
+        up_values = self._scroll_series(self._up) if is_scrolling else self._stable_series(self._up)
+        scale = max(self._display_scale, 100.0)
+        painter.save()
+        painter.setClipRect(QRectF(graph_x, graph_y, graph_w, graph_h))
+        self._draw_series(
+            painter,
+            down_values,
+            QColor(0, 180, 255),
+            graph_x,
+            graph_y,
+            graph_w,
+            graph_h,
+            scale,
+            self._scroll_progress if is_scrolling else 0.0,
+        )
+        self._draw_series(
+            painter,
+            up_values,
+            QColor(0, 220, 120),
+            graph_x,
+            graph_y,
+            graph_w,
+            graph_h,
+            scale,
+            self._scroll_progress if is_scrolling else 0.0,
+        )
+        painter.restore()
         painter.end()
 
     def _draw_series(
         self,
         painter: QPainter,
-        values: deque[float],
+        values: list[float],
         color: QColor,
         graph_x: float,
         graph_y: float,
         graph_w: float,
         graph_h: float,
         scale: float,
+        scroll_progress: float,
     ) -> None:
         if len(values) < 2:
             return
         points: list[QPointF] = []
         step = graph_w / max(1, self._max_points - 1)
-        start_index = self._max_points - len(values)
         for index, value in enumerate(values):
-            x = graph_x + (start_index + index) * step
+            x = graph_x + (index - scroll_progress) * step
             y = graph_y + graph_h - min(1.0, value / scale) * graph_h
             points.append(QPointF(x, y))
-        pen = QPen(color)
-        pen.setWidthF(2.0)
-        painter.setPen(pen)
+
+        path = QPainterPath(points[0])
         for index in range(1, len(points)):
-            painter.drawLine(points[index - 1], points[index])
+            previous = points[index - 1]
+            current = points[index]
+            control_dx = (current.x() - previous.x()) * 0.55
+            path.cubicTo(
+                QPointF(previous.x() + control_dx, previous.y()),
+                QPointF(current.x() - control_dx, current.y()),
+                current,
+            )
+
+        fill_color = QColor(color)
+        fill_color.setAlpha(54)
+        transparent = QColor(color)
+        transparent.setAlpha(0)
+        gradient = QLinearGradient(QPointF(0, graph_y), QPointF(0, graph_y + graph_h))
+        gradient.setColorAt(0.0, fill_color)
+        gradient.setColorAt(1.0, transparent)
+        fill_path = QPainterPath(path)
+        fill_path.lineTo(points[-1].x(), graph_y + graph_h)
+        fill_path.lineTo(points[0].x(), graph_y + graph_h)
+        fill_path.closeSubpath()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(gradient))
+        painter.drawPath(fill_path)
+
+        glow = QColor(color)
+        glow.setAlpha(70)
+        glow_pen = QPen(glow)
+        glow_pen.setWidthF(5.2)
+        glow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        glow_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(glow_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+
+        pen = QPen(color)
+        pen.setWidthF(2.15)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPath(path)
 
 
 class _LineCard(SettingCard):
