@@ -46,6 +46,13 @@ class SingBoxError(RuntimeError):
 
 class SingBoxManager:
     RELEASE_API = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+    CONNECTIVITY_TEST_URLS = (
+        "https://cp.cloudflare.com/generate_204",
+        "https://www.gstatic.com/generate_204",
+        "http://connectivitycheck.gstatic.com/generate_204",
+    )
+    SERVER_REACHABILITY_TIMEOUT = 4.0
+    CORE_CONNECTIVITY_TIMEOUT = 10.0
 
     def __init__(self, logger: logging.Logger | None = None) -> None:
         self.logger = logger or logging.getLogger("razreshenie")
@@ -186,6 +193,7 @@ class SingBoxManager:
                 return
             exe = self.ensure_binary()
             self._preflight_profile(profile)
+            self._preflight_server_reachability(profile)
             self._kill_orphaned(exe)
             if settings.mode == "proxy":
                 self._ensure_proxy_port_free(settings.mixed_listen_host, int(settings.mixed_port))
@@ -203,7 +211,7 @@ class SingBoxManager:
                         "иначе Windows будет использовать чужой DNS, а раздельное туннелирование не сработает."
                     )
 
-            attempts = 3 if settings.mode == "tun" else 2
+            attempts = 3
             last_error = ""
             for attempt in range(1, attempts + 1):
                 if settings.mode == "tun":
@@ -231,7 +239,15 @@ class SingBoxManager:
 
                 if settings.mode != "tun":
                     if self._wait_until_proxy_ready(settings.mixed_listen_host, int(settings.mixed_port)):
-                        return
+                        connected, error = self._wait_until_core_connected(settings)
+                        if connected:
+                            return
+                        last_error = error
+                        self._stop_process_locked()
+                        if attempt < attempts:
+                            time.sleep(0.45)
+                            continue
+                        break
                     exited = self.process is None or self.process.poll() is not None
                     last_error = self._unexpected_exit_message(startup=True) if exited else (
                         "sing-box запустился, но локальный proxy-порт "
@@ -244,7 +260,16 @@ class SingBoxManager:
                     break
 
                 if self._wait_until_tun_ready(settings.tun_interface_name) and self._wait_process_stable():
-                    return
+                    connected, error = self._wait_until_core_connected(settings)
+                    if connected:
+                        return
+                    last_error = error
+                    self._stop_process_locked(wait_tun_release=True, tun_interface_name=settings.tun_interface_name)
+                    if attempt < attempts:
+                        self._wait_tun_released(settings.tun_interface_name)
+                        time.sleep(0.45)
+                        continue
+                    break
 
                 exited = self.process is None or self.process.poll() is not None
                 last_error = self._unexpected_exit_message(startup=True) if exited else (
@@ -318,6 +343,46 @@ class SingBoxManager:
                 time.sleep(0.08)
         return False
 
+    def _wait_until_core_connected(self, settings: AppSettings) -> tuple[bool, str]:
+        deadline = time.monotonic() + self.CORE_CONNECTIVITY_TIMEOUT
+        last_error = "Проверка выхода через core не выполнена"
+        while time.monotonic() < deadline:
+            if not self.process or self.process.poll() is not None:
+                return False, self._unexpected_exit_message(startup=True)
+            ok, error = self._check_core_connectivity_once(settings)
+            if ok:
+                self.logger.info("Проверка подключения через текущий сервер прошла успешно")
+                return True, ""
+            last_error = error
+            time.sleep(0.35)
+        return False, (
+            "sing-box запустился, но проверка выхода через текущий сервер не прошла. "
+            f"Последняя ошибка: {last_error}"
+        )
+
+    def _check_core_connectivity_once(self, settings: AppSettings) -> tuple[bool, str]:
+        session = requests.Session()
+        session.trust_env = False
+        proxy_url = f"http://{self._connect_host(settings.mixed_listen_host)}:{int(settings.mixed_port)}"
+        proxies = {"http": proxy_url, "https": proxy_url} if settings.mode == "proxy" else None
+        last_error = ""
+        for url in self.CONNECTIVITY_TEST_URLS:
+            try:
+                response = session.get(
+                    url,
+                    timeout=(1.5, 2.0),
+                    allow_redirects=False,
+                    proxies=proxies,
+                    headers={"User-Agent": "RazreshenieVPN/1.1.5"},
+                )
+            except requests.RequestException as exc:
+                last_error = f"{url}: {exc}"
+                continue
+            if 200 <= response.status_code < 400:
+                return True, ""
+            last_error = f"{url}: HTTP {response.status_code}"
+        return False, last_error or "нет ответа от проверочных URL"
+
     def _wait_process_stable(self, max_wait: float = 0.7) -> bool:
         deadline = time.monotonic() + max_wait
         while time.monotonic() < deadline:
@@ -370,6 +435,28 @@ class SingBoxManager:
             raise SingBoxError("У выбранного профиля порт вне диапазона 1-65535")
         if not str(profile.uuid or "").strip():
             raise SingBoxError("У выбранного профиля не указан UUID")
+
+    def _preflight_server_reachability(self, profile: VlessProfile) -> None:
+        if self._profile_uses_udp_transport(profile):
+            self.logger.info("Профиль использует UDP/QUIC transport, TCP preflight сервера пропущен")
+            return
+        try:
+            with socket.create_connection(
+                (profile.address, int(profile.port)),
+                timeout=self.SERVER_REACHABILITY_TIMEOUT,
+            ):
+                return
+        except OSError as exc:
+            raise SingBoxError(
+                "Текущий сервер недоступен до запуска core: "
+                f"{profile.address}:{profile.port}. Проверьте сервер или выберите другой профиль."
+            ) from exc
+
+    @staticmethod
+    def _profile_uses_udp_transport(profile: VlessProfile) -> bool:
+        params = {key.lower(): str(value).lower() for key, value in profile.params.items()}
+        network = params.get("type") or params.get("network") or "tcp"
+        return network == "quic"
 
     @staticmethod
     def _tun_interface_has_ipv4(tun_interface_name: str) -> bool:
