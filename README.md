@@ -18,6 +18,10 @@
 
 Спасибо авторам zapret-kvn за открытую работу. Razreshenie VPN Client является отдельным проектом и сохраняет собственную лицензию GPLv3.
 
+Отдельная благодарность open-source проекту **Karing** за часть способов работы, на которые ориентируется Razreshenie VPN Client: определение названий серверов, обработку подписок, проверку задержки через sing-box Clash API и подходы к надежному подключению.
+
+<https://github.com/KaringX/karing>
+
 Отдельная благодарность проекту **russia-mobile-internet-whitelist** за домены из российского «белого списка», используемые во встроенном bypass:
 
 <https://github.com/hxehex/russia-mobile-internet-whitelist>
