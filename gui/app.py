@@ -156,8 +156,8 @@ REGIONAL_INDICATOR_A = 0x1F1E6
 REGIONAL_INDICATOR_Z = 0x1F1FF
 FLAG_ICON_SIZE = QSize(24, 18)
 _FLAG_ICON_CACHE: dict[tuple[str, ...], QIcon] = {}
-LATENCY_SCAN_TIMEOUT_MS = 900
-LATENCY_SCAN_WORKERS = 32
+LATENCY_SCAN_TIMEOUT_MS = 15000
+LATENCY_SCAN_WORKERS = 20
 LATENCY_BATCH_SIZE = 48
 LATENCY_BATCH_INTERVAL_SECONDS = 0.25
 LATENCY_UI_DRAIN_INTERVAL_MS = 16
@@ -1830,6 +1830,7 @@ class RazreshenieWindow(FluentWindow):
             batch_size=LATENCY_BATCH_SIZE,
             batch_interval_seconds=LATENCY_BATCH_INTERVAL_SECONDS,
             logger=self.logger,
+            binary_provider=self.singbox.ensure_binary,
         )
         self.traffic = TrafficMonitor()
         self.scheduler: RepeatingTask | None = None
@@ -2069,12 +2070,15 @@ class RazreshenieWindow(FluentWindow):
             return
         if self.settings.active_profile_id == profile_id:
             return
+        was_running = self.singbox.is_running()
         self.settings.active_profile_id = profile_id
         app_state.save_settings(self.settings)
         self.dashboard_page.set_active_profile(profile)
         self.servers_page.set_active_id(profile_id)
         self.dashboard_page.set_connection(self.singbox.is_running(), self._busy)
         self._refresh_tray_text()
+        if was_running:
+            self._start_or_restart_vpn(profile, "Переключение сервера…")
 
     def set_mode(self, mode: str) -> None:
         previous_mode = self.settings.mode
@@ -2092,6 +2096,8 @@ class RazreshenieWindow(FluentWindow):
         self.settings.mode = next_mode
         app_state.save_settings(self.settings)
         self.dashboard_page.set_mode(self.settings.mode)
+        if previous_mode != next_mode:
+            self._restart_if_connected("Перезапуск режима подключения…")
 
     def toggle_connection(self) -> None:
         if self.singbox.is_running():
@@ -2108,13 +2114,30 @@ class RazreshenieWindow(FluentWindow):
             app_state.save_settings(self.settings)
             self._request_admin_for_tun("Для подключения в TUN-режиме нужны права администратора.")
             return
+        self._start_or_restart_vpn(profile, "Подключение…")
 
+    def _start_or_restart_vpn(self, profile: VlessProfile, busy: str) -> None:
+        if self._busy:
+            self._show_status("info", "Операция подключения уже выполняется")
+            return
         def worker() -> None:
+            if self.settings.enable_system_proxy_guard and self.settings.mode != "proxy":
+                windows.set_system_proxy(False, self.settings.mixed_listen_host, self.settings.mixed_port)
             self.singbox.start(profile, self.settings, self.split_rules)
             if self.settings.enable_system_proxy_guard and self.settings.mode == "proxy":
                 windows.set_system_proxy(True, self.settings.mixed_listen_host, self.settings.mixed_port)
+            elif self.settings.enable_system_proxy_guard:
+                windows.set_system_proxy(False, self.settings.mixed_listen_host, self.settings.mixed_port)
 
-        self._run_background(worker, lambda _result: self._connected_ui(profile), busy="Подключение…")
+        self._run_background(worker, lambda _result: self._connected_ui(profile), busy=busy)
+
+    def _restart_if_connected(self, busy: str) -> None:
+        if not self.singbox.is_running():
+            return
+        profile = self._active_profile()
+        if not profile:
+            return
+        self._start_or_restart_vpn(profile, busy)
 
     def disconnect_vpn(self) -> None:
         def worker() -> None:
@@ -2234,6 +2257,7 @@ class RazreshenieWindow(FluentWindow):
 
         started = self.latency_scanner.scan_profiles(
             profiles,
+            settings=self.settings,
             on_batch=on_batch,
             on_done=on_done,
             on_error=on_error,
@@ -2465,6 +2489,7 @@ class RazreshenieWindow(FluentWindow):
         self._refresh_all_views()
         self.routing_page.select_rule(rule_set.id)
         self._show_status("success", f"Добавлены правила: {rule_set.name} · {rule_set.outbound_label} · {rule_set.total_items} элементов")
+        self._restart_if_connected("Перезапуск маршрутизации…")
 
     def set_rule_set_outbound(self, rule_set_id: str, outbound: str) -> None:
         rule_set = self._rule_set_by_id(rule_set_id)
@@ -2475,6 +2500,7 @@ class RazreshenieWindow(FluentWindow):
         app_state.save_split_rules(self.split_rules)
         self._refresh_all_views()
         self._show_status("success", f"{rule_set.name}: {rule_set.outbound_label}")
+        self._restart_if_connected("Перезапуск маршрутизации…")
 
     def set_rule_set_enabled(self, rule_set_id: str, enabled: bool) -> None:
         rule_set = self._rule_set_by_id(rule_set_id)
@@ -2484,6 +2510,7 @@ class RazreshenieWindow(FluentWindow):
         self.split_rules.enabled = any(item.enabled for item in self.split_rules.rule_sets)
         app_state.save_split_rules(self.split_rules)
         self._refresh_all_views()
+        self._restart_if_connected("Перезапуск маршрутизации…")
 
     def toggle_rule_set(self, rule_set_id: str) -> None:
         rule_set = self._rule_set_by_id(rule_set_id)
@@ -2493,6 +2520,7 @@ class RazreshenieWindow(FluentWindow):
         self.split_rules.enabled = any(item.enabled for item in self.split_rules.rule_sets)
         app_state.save_split_rules(self.split_rules)
         self._refresh_all_views()
+        self._restart_if_connected("Перезапуск маршрутизации…")
 
     def delete_rule_set(self, rule_set_id: str) -> None:
         rule_set = self._rule_set_by_id(rule_set_id)
@@ -2504,6 +2532,7 @@ class RazreshenieWindow(FluentWindow):
         self.split_rules.enabled = any(item.enabled for item in self.split_rules.rule_sets)
         app_state.save_split_rules(self.split_rules)
         self._refresh_all_views()
+        self._restart_if_connected("Перезапуск маршрутизации…")
 
     def clear_rule_sets(self) -> None:
         if not self.split_rules.rule_sets:
@@ -2513,8 +2542,10 @@ class RazreshenieWindow(FluentWindow):
         self.split_rules = SplitRules(enabled=False)
         app_state.save_split_rules(self.split_rules)
         self._refresh_all_views()
+        self._restart_if_connected("Перезапуск маршрутизации…")
 
     def save_settings(self) -> None:
+        before_runtime = self._settings_runtime_key(self.settings)
         try:
             self.settings = self.settings_page.apply_to_settings(self.settings)
             paths.set_portable_mode(self.settings.portable_mode)
@@ -2525,6 +2556,23 @@ class RazreshenieWindow(FluentWindow):
             self._show_status("error", f"Ошибка настроек: {exc}")
             return
         self._show_status("success", "Настройки сохранены")
+        if before_runtime != self._settings_runtime_key(self.settings):
+            self._restart_if_connected("Перезапуск подключения…")
+
+    @staticmethod
+    def _settings_runtime_key(settings: AppSettings) -> tuple[object, ...]:
+        return (
+            settings.mode,
+            settings.mixed_listen_host,
+            int(settings.mixed_port),
+            settings.tun_interface_name,
+            settings.tun_address,
+            int(settings.tun_mtu),
+            tuple(settings.dns_servers),
+            bool(settings.kill_switch),
+            bool(settings.enable_system_proxy_guard),
+            settings.log_level,
+        )
 
     def validate_current_config(self) -> None:
         profile = self._active_profile()

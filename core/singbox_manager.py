@@ -18,7 +18,9 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -44,6 +46,19 @@ class SingBoxError(RuntimeError):
     """Ошибка sing-box core."""
 
 
+@dataclass(frozen=True, slots=True)
+class _ConnectionPlan:
+    """Подготовленный Karing-style план запуска: config уже собран и проверен."""
+
+    profile: VlessProfile
+    settings: AppSettings
+    executable: Path
+    config_path: Path
+    fingerprint: str
+    outbound_count: int
+    clash_api_port: int
+
+
 class SingBoxManager:
     RELEASE_API = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
     CONNECTIVITY_TEST_URLS = (
@@ -64,6 +79,10 @@ class SingBoxManager:
         self._reader_thread: threading.Thread | None = None
         self._last_output_lines: deque[str] = deque(maxlen=120)
         self._active_tun_interface: str | None = None
+        self._active_fingerprint: str | None = None
+        self._active_profile_name: str | None = None
+        self._connection_state = "disconnected"
+        self._connected_at: float | None = None
 
     @staticmethod
     def _no_window_kwargs() -> dict[str, object]:
@@ -82,6 +101,10 @@ class SingBoxManager:
 
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
+
+    @property
+    def connection_state(self) -> str:
+        return self._connection_state
 
     def ensure_binary(self) -> Path:
         exe = self.executable_path
@@ -161,12 +184,20 @@ class SingBoxManager:
         settings: AppSettings,
         split_rules: SplitRules,
     ) -> Path:
-        try:
-            config = self.builder.build(profile, settings, split_rules, paths.log_file_path())
-        except ConfigBuildError as exc:
-            raise SingBoxError(str(exc)) from exc
+        config = self._build_config(profile, settings, split_rules)
         write_json(self.config_path, config)
         return self.config_path
+
+    def _build_config(
+        self,
+        profile: VlessProfile,
+        settings: AppSettings,
+        split_rules: SplitRules,
+    ) -> dict[str, Any]:
+        try:
+            return self.builder.build(profile, settings, split_rules, paths.log_file_path())
+        except ConfigBuildError as exc:
+            raise SingBoxError(str(exc)) from exc
 
     def check_config(self, config_path: Path | None = None) -> tuple[bool, str]:
         exe = self.ensure_binary()
@@ -189,107 +220,179 @@ class SingBoxManager:
 
     def start(self, profile: VlessProfile, settings: AppSettings, split_rules: SplitRules) -> None:
         with self._lock:
-            if self.is_running():
-                return
-            exe = self.ensure_binary()
-            self._preflight_profile(profile)
-            self._preflight_server_reachability(profile)
-            self._kill_orphaned(exe)
-            if settings.mode == "proxy":
-                self._ensure_proxy_port_free(settings.mixed_listen_host, int(settings.mixed_port))
-            config_path = self.build_and_save_config(profile, settings, split_rules)
-            ok, output = self.check_config(config_path)
-            if not ok:
-                raise SingBoxError(f"sing-box отклонил конфигурацию:\n{output}")
-            if settings.mode == "tun":
-                conflicts = self._active_foreign_tun_adapters(settings.tun_interface_name)
-                if conflicts:
-                    names = ", ".join(conflicts[:3])
-                    raise SingBoxError(
-                        "Обнаружен активный TUN другого VPN: "
-                        f"{names}. Закройте Karing или другой VPN-клиент и подключитесь заново, "
-                        "иначе Windows будет использовать чужой DNS, а раздельное туннелирование не сработает."
-                    )
+            fingerprint = self._connection_fingerprint(profile, settings, split_rules)
+            running = self.is_running()
+            if running:
+                if self._active_fingerprint == fingerprint and self._connection_state == "connected":
+                    self.logger.info("Подключение уже активно: %s", self._active_profile_name or profile.name)
+                    return
+                self.logger.info("Конфигурация подключения изменилась, выполняется Karing-style reload")
 
-            attempts = 3
-            last_error = ""
-            for attempt in range(1, attempts + 1):
-                if settings.mode == "tun":
-                    self._clear_runtime_cache(exe)
-                    self._flush_windows_dns_cache()
-                elif attempt > 1:
-                    self._ensure_proxy_port_free(settings.mixed_listen_host, int(settings.mixed_port))
-                self._clear_last_output()
-                self.logger.info("Запуск sing-box: %s (попытка %s/%s)", config_path, attempt, attempts)
-                self._active_tun_interface = settings.tun_interface_name if settings.mode == "tun" else None
-                self.process = subprocess.Popen(
-                    [str(exe), "run", "-c", str(config_path), "-D", str(exe.parent)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    cwd=str(exe.parent),
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    **self._no_window_kwargs(),
+            self._connection_state = "reloading" if running else "connecting"
+            stopped_for_reload = False
+            try:
+                plan = self._prepare_connection_plan(profile, settings, split_rules, fingerprint)
+                if running:
+                    self._stop_process_locked(wait_tun_release=True, mark_disconnected=False)
+                    stopped_for_reload = True
+                self._start_prepared_plan(plan, reload=running)
+            except Exception:
+                if stopped_for_reload or not running:
+                    self._mark_disconnected()
+                elif self.process and self.process.poll() is None:
+                    self._connection_state = "connected"
+                else:
+                    self._mark_disconnected()
+                raise
+
+    def _prepare_connection_plan(
+        self,
+        profile: VlessProfile,
+        settings: AppSettings,
+        split_rules: SplitRules,
+        fingerprint: str,
+    ) -> _ConnectionPlan:
+        exe = self.ensure_binary()
+        self._preflight_profile(profile)
+        self._preflight_server_reachability(profile)
+        config = self._build_config(profile, settings, split_rules)
+        clash_api_port = self._reserve_local_port()
+        config.setdefault("experimental", {})["clash_api"] = {
+            "external_controller": f"127.0.0.1:{clash_api_port}",
+            "secret": "",
+        }
+        write_json(self.config_path, config)
+        ok, output = self.check_config(self.config_path)
+        if not ok:
+            raise SingBoxError(f"sing-box отклонил конфигурацию:\n{output}")
+        if settings.mode == "tun":
+            conflicts = self._active_foreign_tun_adapters(settings.tun_interface_name)
+            if conflicts:
+                names = ", ".join(conflicts[:3])
+                raise SingBoxError(
+                    "Обнаружен активный TUN другого VPN: "
+                    f"{names}. Закройте Karing или другой VPN-клиент и подключитесь заново, "
+                    "иначе Windows будет использовать чужой DNS, а раздельное туннелирование не сработает."
                 )
-                self._reader_thread = threading.Thread(target=self._read_process_logs, daemon=True)
-                self._reader_thread.start()
+        outbound_count = len(config.get("outbounds") or [])
+        self.logger.info("Karing-style setServer: config готов, outbounds=%s", outbound_count)
+        return _ConnectionPlan(
+            profile=profile,
+            settings=settings,
+            executable=exe,
+            config_path=self.config_path,
+            fingerprint=fingerprint,
+            outbound_count=outbound_count,
+            clash_api_port=clash_api_port,
+        )
 
-                if settings.mode != "tun":
-                    if self._wait_until_proxy_ready(settings.mixed_listen_host, int(settings.mixed_port)):
-                        connected, error = self._wait_until_core_connected(settings)
-                        if connected:
-                            return
-                        last_error = error
-                        self._stop_process_locked()
-                        if attempt < attempts:
-                            time.sleep(0.45)
-                            continue
-                        break
-                    exited = self.process is None or self.process.poll() is not None
-                    last_error = self._unexpected_exit_message(startup=True) if exited else (
-                        "sing-box запустился, но локальный proxy-порт "
-                        f"{settings.mixed_listen_host}:{settings.mixed_port} не принимает подключения"
+    def _start_prepared_plan(self, plan: _ConnectionPlan, *, reload: bool) -> None:
+        exe = plan.executable
+        settings = plan.settings
+        attempts = 3
+        last_error = ""
+        self._kill_orphaned(exe)
+        if settings.mode == "proxy":
+            self._ensure_proxy_port_free(settings.mixed_listen_host, int(settings.mixed_port))
+        for attempt in range(1, attempts + 1):
+            self._connection_state = "reloading" if reload else "connecting"
+            if settings.mode == "tun":
+                self._clear_runtime_cache(exe)
+                self._flush_windows_dns_cache()
+            elif attempt > 1:
+                self._ensure_proxy_port_free(settings.mixed_listen_host, int(settings.mixed_port))
+            self._clear_last_output()
+            action = "reload" if reload else "start"
+            self.logger.info(
+                "Karing-style %s sing-box: %s (попытка %s/%s)",
+                action,
+                plan.config_path,
+                attempt,
+                attempts,
+            )
+            self._active_tun_interface = settings.tun_interface_name if settings.mode == "tun" else None
+            self.process = subprocess.Popen(
+                [str(exe), "run", "-c", str(plan.config_path), "-D", str(exe.parent)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                cwd=str(exe.parent),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                **self._no_window_kwargs(),
+            )
+            self._reader_thread = threading.Thread(target=self._read_process_logs, daemon=True)
+            self._reader_thread.start()
+
+            if settings.mode != "tun":
+                if self._wait_until_proxy_ready(settings.mixed_listen_host, int(settings.mixed_port)):
+                    connected, error = self._wait_until_core_connected(
+                        settings,
+                        plan.outbound_count,
+                        plan.clash_api_port,
                     )
-                    self._stop_process_locked()
-                    if attempt < attempts:
-                        time.sleep(0.35)
-                        continue
-                    break
-
-                if self._wait_until_tun_ready(settings.tun_interface_name) and self._wait_process_stable():
-                    connected, error = self._wait_until_core_connected(settings)
                     if connected:
+                        self._mark_connected(plan.profile, plan.fingerprint)
                         return
                     last_error = error
-                    self._stop_process_locked(wait_tun_release=True, tun_interface_name=settings.tun_interface_name)
+                    self._stop_process_locked()
                     if attempt < attempts:
-                        self._wait_tun_released(settings.tun_interface_name)
                         time.sleep(0.45)
                         continue
                     break
-
                 exited = self.process is None or self.process.poll() is not None
                 last_error = self._unexpected_exit_message(startup=True) if exited else (
-                    f"sing-box запустился, но TUN-интерфейс '{settings.tun_interface_name}' не получил IPv4-адрес"
+                    "sing-box запустился, но локальный proxy-порт "
+                    f"{settings.mixed_listen_host}:{settings.mixed_port} не принимает подключения"
                 )
-                retryable = exited and self._startup_error_is_retryable()
-                self._stop_process_locked(wait_tun_release=True, tun_interface_name=settings.tun_interface_name)
-                if retryable and attempt < attempts:
-                    self._wait_tun_released(settings.tun_interface_name)
+                self._stop_process_locked()
+                if attempt < attempts:
+                    time.sleep(0.35)
                     continue
                 break
 
-            raise SingBoxError(last_error or "Не удалось запустить sing-box")
+            tun_wait = self._startup_timeout(plan.outbound_count, tun=True)
+            if self._wait_until_tun_ready(settings.tun_interface_name, max_wait=tun_wait) and self._wait_process_stable():
+                connected, error = self._wait_until_core_connected(settings, plan.outbound_count, plan.clash_api_port)
+                if connected:
+                    self._mark_connected(plan.profile, plan.fingerprint)
+                    return
+                last_error = error
+                self._stop_process_locked(wait_tun_release=True, tun_interface_name=settings.tun_interface_name)
+                if attempt < attempts:
+                    self._wait_tun_released(settings.tun_interface_name)
+                    time.sleep(0.45)
+                    continue
+                break
+
+            exited = self.process is None or self.process.poll() is not None
+            last_error = self._unexpected_exit_message(startup=True) if exited else (
+                f"sing-box запустился, но TUN-интерфейс '{settings.tun_interface_name}' не получил IPv4-адрес"
+            )
+            retryable = exited and self._startup_error_is_retryable()
+            self._stop_process_locked(wait_tun_release=True, tun_interface_name=settings.tun_interface_name)
+            if retryable and attempt < attempts:
+                self._wait_tun_released(settings.tun_interface_name)
+                continue
+            break
+        raise SingBoxError(last_error or "Не удалось запустить sing-box")
 
     def stop(self) -> None:
         with self._lock:
             self._stop_process_locked(wait_tun_release=True)
 
-    def _stop_process_locked(self, wait_tun_release: bool = False, tun_interface_name: str | None = None) -> None:
+    def _stop_process_locked(
+        self,
+        wait_tun_release: bool = False,
+        tun_interface_name: str | None = None,
+        *,
+        mark_disconnected: bool = True,
+    ) -> None:
         if not self.process:
+            if mark_disconnected:
+                self._mark_disconnected()
             return
         proc = self.process
         interface_name = tun_interface_name or self._active_tun_interface
@@ -303,7 +406,8 @@ class SingBoxManager:
                 proc.kill()
                 proc.wait(timeout=5)
         self.process = None
-        self._active_tun_interface = None
+        if mark_disconnected:
+            self._mark_disconnected()
         if wait_tun_release:
             self._wait_tun_released(interface_name)
             self._flush_windows_dns_cache()
@@ -330,6 +434,51 @@ class SingBoxManager:
         with self._output_lock:
             return list(self._last_output_lines)
 
+    def _mark_connected(self, profile: VlessProfile, fingerprint: str) -> None:
+        self._active_fingerprint = fingerprint
+        self._active_profile_name = profile.name
+        self._connection_state = "connected"
+        self._connected_at = time.monotonic()
+        self.logger.info("Подключение активно: %s", profile.name)
+
+    def _mark_disconnected(self) -> None:
+        self._active_tun_interface = None
+        self._active_fingerprint = None
+        self._active_profile_name = None
+        self._connection_state = "disconnected"
+        self._connected_at = None
+
+    def _connection_fingerprint(
+        self,
+        profile: VlessProfile,
+        settings: AppSettings,
+        split_rules: SplitRules,
+    ) -> str:
+        payload = {
+            "profile": {
+                "protocol": profile.protocol,
+                "address": profile.address,
+                "port": int(profile.port),
+                "uuid": profile.uuid,
+                "raw_url": profile.raw_url,
+                "params": dict(sorted(profile.params.items())),
+            },
+            "settings": {
+                "mode": settings.mode,
+                "mixed_listen_host": settings.mixed_listen_host,
+                "mixed_port": int(settings.mixed_port),
+                "tun_interface_name": settings.tun_interface_name,
+                "tun_address": settings.tun_address,
+                "tun_mtu": int(settings.tun_mtu),
+                "dns_servers": list(settings.dns_servers),
+                "kill_switch": bool(settings.kill_switch),
+                "log_level": settings.log_level,
+            },
+            "split_rules": split_rules.to_dict(),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
     def _wait_until_proxy_ready(self, host: str, port: int, max_wait: float = 8.0) -> bool:
         connect_host = self._connect_host(host)
         deadline = time.monotonic() + max_wait
@@ -343,13 +492,18 @@ class SingBoxManager:
                 time.sleep(0.08)
         return False
 
-    def _wait_until_core_connected(self, settings: AppSettings) -> tuple[bool, str]:
-        deadline = time.monotonic() + self.CORE_CONNECTIVITY_TIMEOUT
+    def _wait_until_core_connected(
+        self,
+        settings: AppSettings,
+        outbound_count: int = 1,
+        clash_api_port: int | None = None,
+    ) -> tuple[bool, str]:
+        deadline = time.monotonic() + self._startup_timeout(outbound_count, tun=settings.mode == "tun")
         last_error = "Проверка выхода через core не выполнена"
         while time.monotonic() < deadline:
             if not self.process or self.process.poll() is not None:
                 return False, self._unexpected_exit_message(startup=True)
-            ok, error = self._check_core_connectivity_once(settings)
+            ok, error = self._check_core_connectivity_once(settings, clash_api_port)
             if ok:
                 self.logger.info("Проверка подключения через текущий сервер прошла успешно")
                 return True, ""
@@ -360,9 +514,39 @@ class SingBoxManager:
             f"Последняя ошибка: {last_error}"
         )
 
-    def _check_core_connectivity_once(self, settings: AppSettings) -> tuple[bool, str]:
+    @classmethod
+    def _startup_timeout(cls, outbound_count: int, *, tun: bool) -> float:
+        """Karing-style timeout: больше outbounds и TUN дают больше времени core."""
+        count = max(1, int(outbound_count or 1))
+        base = cls.CORE_CONNECTIVITY_TIMEOUT + (10.0 if tun else 0.0)
+        extra = min(18.0 if tun else 10.0, count / 150.0)
+        return base + extra
+
+    def _check_core_connectivity_once(
+        self,
+        settings: AppSettings,
+        clash_api_port: int | None = None,
+    ) -> tuple[bool, str]:
         session = requests.Session()
         session.trust_env = False
+        if clash_api_port:
+            api_url = f"http://127.0.0.1:{int(clash_api_port)}/proxies/proxy/delay"
+            try:
+                response = session.get(
+                    api_url,
+                    params={"url": self.CONNECTIVITY_TEST_URLS[0], "timeout": 5000},
+                    timeout=(1.0, 6.0),
+                    headers={"User-Agent": "RazreshenieVPN/1.1.5"},
+                )
+                if response.status_code == 200:
+                    delay = response.json().get("delay")
+                    if int(delay) >= 0:
+                        return True, ""
+                    return False, f"Clash API delay вернул некорректное значение: {delay}"
+                return False, f"Clash API delay: HTTP {response.status_code}"
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                return False, f"Clash API delay: {exc}"
+
         proxy_url = f"http://{self._connect_host(settings.mixed_listen_host)}:{int(settings.mixed_port)}"
         proxies = {"http": proxy_url, "https": proxy_url} if settings.mode == "proxy" else None
         last_error = ""
@@ -382,6 +566,12 @@ class SingBoxManager:
                 return True, ""
             last_error = f"{url}: HTTP {response.status_code}"
         return False, last_error or "нет ответа от проверочных URL"
+
+    @staticmethod
+    def _reserve_local_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
 
     def _wait_process_stable(self, max_wait: float = 0.7) -> bool:
         deadline = time.monotonic() + max_wait
@@ -527,12 +717,14 @@ class SingBoxManager:
         if os.name != "nt":
             return []
         own = str(own_interface_name or "").replace("'", "''")
+        active = str(self._active_tun_interface or "").replace("'", "''")
         script = (
             "$ErrorActionPreference='SilentlyContinue'; "
             f"$own='{own}'; "
+            f"$active='{active}'; "
             "Get-NetAdapter | "
             "Where-Object { "
-            "$_.Status -eq 'Up' -and $_.Name -ne $own -and "
+            "$_.Status -eq 'Up' -and $_.Name -ne $own -and $_.Name -ne $active -and "
             "($_.Name -match '(?i)(tun|wintun|wireguard|karing)' -or "
             "$_.InterfaceDescription -match '(?i)(tun|wintun|wireguard|tunnel|karing)') "
             "} | ForEach-Object { $_.Name }"

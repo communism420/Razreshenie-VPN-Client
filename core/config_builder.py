@@ -138,6 +138,12 @@ class SingBoxConfigBuilder:
 
         return outbound
 
+    def build_latency_test_outbound(self, profile: VlessProfile, tag: str) -> dict[str, Any]:
+        """Собирает VLESS outbound с внешним tag для Karing-style delay API."""
+        outbound = self._build_vless_outbound(profile)
+        outbound["tag"] = tag
+        return outbound
+
     def _build_tls(self, profile: VlessProfile) -> dict[str, Any] | None:
         security = (self._param(profile, "security") or "none").lower()
         if security not in {"tls", "reality"}:
