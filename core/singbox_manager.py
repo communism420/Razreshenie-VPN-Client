@@ -40,6 +40,7 @@ from models.rules import SplitRules
 from models.settings import AppSettings
 from utils import paths
 from utils.storage import read_json, write_json
+from utils.version import APP_VERSION
 
 
 class SingBoxError(RuntimeError):
@@ -62,8 +63,12 @@ class _ConnectionPlan:
 class SingBoxManager:
     RELEASE_API = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
     CONNECTIVITY_TEST_URLS = (
-        "https://cp.cloudflare.com/generate_204",
         "https://www.gstatic.com/generate_204",
+        "http://www.msftconnecttest.com/connecttest.txt",
+        "http://cp.cloudflare.com/generate_204",
+        "https://checkip.amazonaws.com",
+        "http://connectivity-check.ubuntu.com",
+        "http://detectportal.firefox.com/success.txt",
         "http://connectivitycheck.gstatic.com/generate_204",
     )
     SERVER_REACHABILITY_TIMEOUT = 4.0
@@ -254,7 +259,6 @@ class SingBoxManager:
     ) -> _ConnectionPlan:
         exe = self.ensure_binary()
         self._preflight_profile(profile)
-        self._preflight_server_reachability(profile)
         config = self._build_config(profile, settings, split_rules)
         clash_api_port = self._reserve_local_port()
         config.setdefault("experimental", {})["clash_api"] = {
@@ -266,7 +270,7 @@ class SingBoxManager:
         if not ok:
             raise SingBoxError(f"sing-box отклонил конфигурацию:\n{output}")
         if settings.mode == "tun":
-            conflicts = self._active_foreign_tun_adapters(settings.tun_interface_name)
+            conflicts = self._active_foreign_tun_adapters(settings.tun_interface_name, timeout=1.2)
             if conflicts:
                 names = ", ".join(conflicts[:3])
                 raise SingBoxError(
@@ -291,14 +295,14 @@ class SingBoxManager:
         settings = plan.settings
         attempts = 3
         last_error = ""
-        self._kill_orphaned(exe)
         if settings.mode == "proxy":
             self._ensure_proxy_port_free(settings.mixed_listen_host, int(settings.mixed_port))
         for attempt in range(1, attempts + 1):
             self._connection_state = "reloading" if reload else "connecting"
+            if attempt > 1:
+                self._kill_orphaned(exe)
             if settings.mode == "tun":
                 self._clear_runtime_cache(exe)
-                self._flush_windows_dns_cache()
             elif attempt > 1:
                 self._ensure_proxy_port_free(settings.mixed_listen_host, int(settings.mixed_port))
             self._clear_last_output()
@@ -327,21 +331,11 @@ class SingBoxManager:
             self._reader_thread.start()
 
             if settings.mode != "tun":
-                if self._wait_until_proxy_ready(settings.mixed_listen_host, int(settings.mixed_port)):
-                    connected, error = self._wait_until_core_connected(
-                        settings,
-                        plan.outbound_count,
-                        plan.clash_api_port,
-                    )
-                    if connected:
-                        self._mark_connected(plan.profile, plan.fingerprint)
-                        return
-                    last_error = error
-                    self._stop_process_locked()
-                    if attempt < attempts:
-                        time.sleep(0.45)
-                        continue
-                    break
+                if self._wait_until_proxy_ready(settings.mixed_listen_host, int(settings.mixed_port), max_wait=3.0):
+                    self._wait_until_clash_api_ready(plan.clash_api_port, max_wait=1.0)
+                    self._mark_connected(plan.profile, plan.fingerprint)
+                    self._start_background_health_check(plan)
+                    return
                 exited = self.process is None or self.process.poll() is not None
                 last_error = self._unexpected_exit_message(startup=True) if exited else (
                     "sing-box запустился, но локальный proxy-порт "
@@ -353,30 +347,24 @@ class SingBoxManager:
                     continue
                 break
 
-            tun_wait = self._startup_timeout(plan.outbound_count, tun=True)
-            if self._wait_until_tun_ready(settings.tun_interface_name, max_wait=tun_wait) and self._wait_process_stable():
-                connected, error = self._wait_until_core_connected(settings, plan.outbound_count, plan.clash_api_port)
-                if connected:
-                    self._mark_connected(plan.profile, plan.fingerprint)
-                    return
-                last_error = error
+            if not self._wait_process_stable(max_wait=0.25):
+                exited = self.process is None or self.process.poll() is not None
+                last_error = self._unexpected_exit_message(startup=True) if exited else "sing-box не стабилизировался после запуска"
+                retryable = exited and self._startup_error_is_retryable()
                 self._stop_process_locked(wait_tun_release=True, tun_interface_name=settings.tun_interface_name)
-                if attempt < attempts:
+                if retryable and attempt < attempts:
                     self._wait_tun_released(settings.tun_interface_name)
-                    time.sleep(0.45)
                     continue
                 break
 
-            exited = self.process is None or self.process.poll() is not None
-            last_error = self._unexpected_exit_message(startup=True) if exited else (
-                f"sing-box запустился, но TUN-интерфейс '{settings.tun_interface_name}' не получил IPv4-адрес"
-            )
-            retryable = exited and self._startup_error_is_retryable()
-            self._stop_process_locked(wait_tun_release=True, tun_interface_name=settings.tun_interface_name)
-            if retryable and attempt < attempts:
-                self._wait_tun_released(settings.tun_interface_name)
-                continue
-            break
+            if not self._wait_until_clash_api_ready(plan.clash_api_port, max_wait=1.5):
+                self.logger.warning(
+                    "sing-box запустился, но Clash API не ответил сразу; продолжаю запуск как Karing-style service start"
+                )
+            self._mark_connected(plan.profile, plan.fingerprint)
+            self._start_background_health_check(plan)
+            self._start_post_connect_tasks(settings)
+            return
         raise SingBoxError(last_error or "Не удалось запустить sing-box")
 
     def stop(self) -> None:
@@ -448,6 +436,40 @@ class SingBoxManager:
         self._connection_state = "disconnected"
         self._connected_at = None
 
+    def _start_background_health_check(self, plan: _ConnectionPlan) -> None:
+        def worker() -> None:
+            connected, error = self._wait_until_core_connected(
+                plan.settings,
+                plan.outbound_count,
+                plan.clash_api_port,
+                max_wait=8.0,
+            )
+            with self._lock:
+                still_current = self._active_fingerprint == plan.fingerprint and self._connection_state == "connected"
+            if not still_current:
+                return
+            if connected:
+                self.logger.info("Фоновая проверка выхода через текущий сервер прошла успешно")
+            else:
+                self.logger.warning("Фоновая проверка выхода через текущий сервер не прошла: %s", error)
+
+        threading.Thread(target=worker, name="RazreshenieCoreHealthCheck", daemon=True).start()
+
+    def _start_post_connect_tasks(self, settings: AppSettings) -> None:
+        if settings.mode != "tun":
+            return
+        tun_interface_name = settings.tun_interface_name
+
+        def worker() -> None:
+            self._flush_windows_dns_cache()
+            if not self._wait_until_tun_ready(tun_interface_name, max_wait=2.0):
+                self.logger.debug(
+                    "TUN-интерфейс '%s' не показал IPv4 в короткой фоновой проверке",
+                    tun_interface_name,
+                )
+
+        threading.Thread(target=worker, name="RazreshenieTunPostConnect", daemon=True).start()
+
     def _connection_fingerprint(
         self,
         profile: VlessProfile,
@@ -497,8 +519,10 @@ class SingBoxManager:
         settings: AppSettings,
         outbound_count: int = 1,
         clash_api_port: int | None = None,
+        max_wait: float | None = None,
     ) -> tuple[bool, str]:
-        deadline = time.monotonic() + self._startup_timeout(outbound_count, tun=settings.mode == "tun")
+        timeout = max_wait if max_wait is not None else self._startup_timeout(outbound_count, tun=settings.mode == "tun")
+        deadline = time.monotonic() + timeout
         last_error = "Проверка выхода через core не выполнена"
         while time.monotonic() < deadline:
             if not self.process or self.process.poll() is not None:
@@ -513,6 +537,24 @@ class SingBoxManager:
             "sing-box запустился, но проверка выхода через текущий сервер не прошла. "
             f"Последняя ошибка: {last_error}"
         )
+
+    def _wait_until_clash_api_ready(self, clash_api_port: int | None, max_wait: float = 1.5) -> bool:
+        if not clash_api_port:
+            return True
+        deadline = time.monotonic() + max_wait
+        url = f"http://127.0.0.1:{int(clash_api_port)}/version"
+        session = requests.Session()
+        session.trust_env = False
+        while time.monotonic() < deadline:
+            if not self.process or self.process.poll() is not None:
+                return False
+            try:
+                response = session.get(url, timeout=0.2)
+                if response.status_code == 200:
+                    return True
+            except requests.RequestException:
+                time.sleep(0.05)
+        return False
 
     @classmethod
     def _startup_timeout(cls, outbound_count: int, *, tun: bool) -> float:
@@ -536,7 +578,7 @@ class SingBoxManager:
                     api_url,
                     params={"url": self.CONNECTIVITY_TEST_URLS[0], "timeout": 5000},
                     timeout=(1.0, 6.0),
-                    headers={"User-Agent": "RazreshenieVPN/1.1.5"},
+                    headers={"User-Agent": self._user_agent()},
                 )
                 if response.status_code == 200:
                     delay = response.json().get("delay")
@@ -557,7 +599,7 @@ class SingBoxManager:
                     timeout=(1.5, 2.0),
                     allow_redirects=False,
                     proxies=proxies,
-                    headers={"User-Agent": "RazreshenieVPN/1.1.5"},
+                    headers={"User-Agent": self._user_agent()},
                 )
             except requests.RequestException as exc:
                 last_error = f"{url}: {exc}"
@@ -588,7 +630,8 @@ class SingBoxManager:
         while time.monotonic() < deadline:
             if not self.process or self.process.poll() is not None:
                 return False
-            if self._tun_interface_has_ipv4(tun_interface_name):
+            command_timeout = max(0.2, min(0.7, deadline - time.monotonic()))
+            if self._tun_interface_has_ipv4(tun_interface_name, timeout=command_timeout):
                 return True
             time.sleep(0.25)
         return False
@@ -599,6 +642,10 @@ class SingBoxManager:
         if value in {"", "0.0.0.0", "::", "[::]"}:
             return "127.0.0.1"
         return value.strip("[]")
+
+    @staticmethod
+    def _user_agent() -> str:
+        return f"RazreshenieVPN/{APP_VERSION}"
 
     def _ensure_proxy_port_free(self, host: str, port: int) -> None:
         connect_host = self._connect_host(host)
@@ -649,7 +696,7 @@ class SingBoxManager:
         return network == "quic"
 
     @staticmethod
-    def _tun_interface_has_ipv4(tun_interface_name: str) -> bool:
+    def _tun_interface_has_ipv4(tun_interface_name: str, timeout: float = 4.0) -> bool:
         escaped_name = tun_interface_name.replace("'", "''")
         script = (
             f"$ipv4 = Get-NetIPAddress -InterfaceAlias '{escaped_name}' -AddressFamily IPv4 -ErrorAction SilentlyContinue "
@@ -664,7 +711,7 @@ class SingBoxManager:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=4,
+                timeout=max(0.2, float(timeout)),
                 check=False,
                 **SingBoxManager._no_window_kwargs(),
             )
@@ -713,7 +760,7 @@ class SingBoxManager:
             except OSError:
                 self.logger.debug("Не удалось удалить runtime-cache sing-box: %s", exe.parent / name, exc_info=True)
 
-    def _active_foreign_tun_adapters(self, own_interface_name: str) -> list[str]:
+    def _active_foreign_tun_adapters(self, own_interface_name: str, timeout: float = 6.0) -> list[str]:
         if os.name != "nt":
             return []
         own = str(own_interface_name or "").replace("'", "''")
@@ -736,7 +783,7 @@ class SingBoxManager:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=6,
+                timeout=max(0.5, float(timeout)),
                 check=False,
                 **self._no_window_kwargs(),
             )
@@ -755,7 +802,7 @@ class SingBoxManager:
             f"$target='{target}'; "
             "Get-CimInstance Win32_Process -Filter \"Name = 'sing-box.exe'\" | "
             "Where-Object { $_.ExecutablePath -eq $target } | "
-            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+            "ForEach-Object { $_.ProcessId; Stop-Process -Id $_.ProcessId -Force }"
         )
         try:
             result = subprocess.run(
@@ -770,7 +817,7 @@ class SingBoxManager:
             )
         except (OSError, subprocess.SubprocessError):
             return
-        if result.returncode == 0:
+        if result.returncode == 0 and result.stdout.strip():
             time.sleep(0.8)
 
     def _startup_error_is_retryable(self) -> bool:

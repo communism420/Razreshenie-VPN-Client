@@ -52,6 +52,8 @@ KARING_URL_TEST_LIST = (
 KARING_URL_TEST_TIMEOUT_SECONDS = 15
 KARING_LATENCY_MAX_CONCURRENCY = 20
 KARING_LATENCY_CONTROL_HOST = "127.0.0.1"
+KARING_LATENCY_RETRY_COUNT = 1
+KARING_LATENCY_FALLBACK_TIMEOUT_MS = 5000
 
 
 LatencyBatch = list[tuple[str, int | None]]
@@ -630,16 +632,43 @@ class LatencyScanner:
         raise RuntimeError("latency core не запустил Clash API вовремя")
 
     def _measure_outbound_delay(self, controller_port: int, tag: str) -> int | None:
+        """Повторяет Karing URL-test и использует тот же список URL как быстрый fallback."""
+        for _attempt in range(KARING_LATENCY_RETRY_COUNT):
+            if self._cancel_event.is_set():
+                return None
+            latency = self._measure_outbound_delay_once(controller_port, tag, KARING_URL_TEST_LIST[0], self.timeout_ms)
+            if latency is not None:
+                return latency
+
+        fallback_timeout_ms = min(self.timeout_ms, KARING_LATENCY_FALLBACK_TIMEOUT_MS)
+        best_latency: int | None = None
+        for test_url in KARING_URL_TEST_LIST[1:]:
+            if self._cancel_event.is_set():
+                return best_latency
+            latency = self._measure_outbound_delay_once(controller_port, tag, test_url, fallback_timeout_ms)
+            if latency is not None:
+                best_latency = latency if best_latency is None else min(best_latency, latency)
+                if best_latency <= 250:
+                    return best_latency
+        return best_latency
+
+    def _measure_outbound_delay_once(
+        self,
+        controller_port: int,
+        tag: str,
+        test_url: str,
+        timeout_ms: int,
+    ) -> int | None:
         session = requests.Session()
         session.trust_env = False
         url = f"http://{KARING_LATENCY_CONTROL_HOST}:{controller_port}/proxies/{quote(tag, safe='')}/delay"
-        timeout_seconds = max(1.0, self.timeout_ms / 1000.0)
+        timeout_seconds = max(1.0, int(timeout_ms) / 1000.0)
         try:
             response = session.get(
                 url,
                 params={
-                    "url": KARING_URL_TEST_LIST[0],
-                    "timeout": int(self.timeout_ms),
+                    "url": test_url,
+                    "timeout": int(timeout_ms),
                 },
                 timeout=timeout_seconds + 2.0,
             )
@@ -653,7 +682,7 @@ class LatencyScanner:
             latency = int(value)
         except (TypeError, ValueError):
             return None
-        return latency if latency >= 0 else None
+        return latency if latency > 0 else None
 
     def _stop_latency_core(self) -> None:
         with self._process_lock:
