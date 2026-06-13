@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from models.connection import ServerQualityStats, SmartGroup
 from models.profile import Subscription, VlessProfile
 from models.rules import SplitRules
 from models.settings import AppSettings
@@ -71,3 +72,43 @@ def load_split_rules() -> SplitRules:
 
 def save_split_rules(rules: SplitRules) -> None:
     write_json(paths.rules_path(), rules.to_dict())
+
+
+def load_quality_stats() -> dict[str, ServerQualityStats]:
+    raw = read_json(paths.quality_stats_path(), {})
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        items = raw.values()
+    else:
+        items = []
+    result: dict[str, ServerQualityStats] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        stats = ServerQualityStats.from_dict(item)
+        if stats.profile_id:
+            result[stats.profile_id] = stats
+    return result
+
+
+def save_quality_stats(stats: dict[str, ServerQualityStats]) -> None:
+    write_json(
+        paths.quality_stats_path(),
+        {
+            profile_id: item.to_dict()
+            for profile_id, item in sorted(stats.items())
+            if profile_id and item.profile_id
+        },
+    )
+
+
+def load_smart_groups() -> list[SmartGroup]:
+    raw = read_json(paths.smart_groups_path(), [])
+    if not isinstance(raw, list):
+        return []
+    return [SmartGroup.from_dict(item) for item in raw if isinstance(item, dict)]
+
+
+def save_smart_groups(groups: list[SmartGroup]) -> None:
+    write_json(paths.smart_groups_path(), [group.to_dict() for group in groups])

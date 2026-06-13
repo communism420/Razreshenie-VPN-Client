@@ -23,17 +23,24 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from models.profile import VlessProfile
+from core.outbound_builder import OutboundBuilder, OutboundBuildError
+from models.profile import ServerProfile
 from models.rules import (
     ROUTE_OUTBOUNDS,
     ROUTE_OUTBOUND_DIRECT,
     ROUTE_OUTBOUND_PROXY,
+    RouteRuleSetResource,
     RoutingRuleSet,
     SplitRules,
     builtin_direct_rule_sets,
+    clean_process_names,
+    clean_process_path_regexes,
+    clean_process_paths,
     normalize_outbound,
+    normalize_rule_set_resource_format,
+    normalize_rule_set_resource_type,
 )
-from models.settings import AppSettings
+from models.settings import AppSettings, normalize_dns_strategy
 
 
 class ConfigBuildError(ValueError):
@@ -44,22 +51,15 @@ KARING_WINDOWS_TUN_STACK = "gvisor"
 KARING_WINDOWS_TUN_MTU = 4064
 
 
-def _truthy(value: str | None) -> bool:
-    return str(value or "").lower() in {"1", "true", "yes", "y", "on", "enabled"}
-
-
-def _split_csv(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
 class SingBoxConfigBuilder:
     """Собирает валидный конфиг sing-box без ручного редактирования JSON."""
 
+    def __init__(self) -> None:
+        self.outbound_builder = OutboundBuilder()
+
     def build(
         self,
-        profile: VlessProfile,
+        profile: ServerProfile,
         settings: AppSettings,
         split_rules: SplitRules,
         log_path: Path | None,
@@ -67,16 +67,31 @@ class SingBoxConfigBuilder:
         if settings.mode not in {"proxy", "tun"}:
             raise ConfigBuildError("Неизвестный режим подключения")
 
+        try:
+            proxy_outbound = self.outbound_builder.build(profile, tag="proxy")
+        except OutboundBuildError as exc:
+            raise ConfigBuildError(str(exc)) from exc
+
         dns = self._build_dns(settings, split_rules)
         outbounds = [
-            self._build_vless_outbound(profile),
+            proxy_outbound,
             {
                 "type": "direct",
                 "tag": "direct",
                 "domain_resolver": "bootstrap-dns",
             },
         ]
-        route_rules, final_outbound = self._build_route_rules(split_rules)
+        route_rule_sets = self._build_route_rule_sets(split_rules)
+        available_rule_set_tags = {item["tag"] for item in route_rule_sets}
+        route_rules, final_outbound = self._build_route_rules(split_rules, available_rule_set_tags)
+        route: dict[str, Any] = {
+            "auto_detect_interface": True,
+            "default_domain_resolver": "proxy-dns",
+            "rules": route_rules,
+            "final": final_outbound,
+        }
+        if route_rule_sets:
+            route["rule_set"] = route_rule_sets
 
         config: dict[str, Any] = {
             "log": {
@@ -86,158 +101,19 @@ class SingBoxConfigBuilder:
             "dns": dns,
             "inbounds": self._build_inbounds(settings),
             "outbounds": outbounds,
-            "route": {
-                "auto_detect_interface": True,
-                "default_domain_resolver": "proxy-dns",
-                "rules": route_rules,
-                "final": final_outbound,
-            },
+            "route": route,
         }
         # Не задаем sing-box log.output: stdout читает SingBoxManager, а приложение
         # уже сохраняет эти строки в общий лог и live-журнал доменов.
         _ = log_path
         return config
 
-    def _param(self, profile: VlessProfile, *names: str) -> str | None:
-        lower_map = {key.lower(): value for key, value in profile.params.items()}
-        for name in names:
-            value = lower_map.get(name.lower())
-            if value is not None and value != "":
-                return value
-        return None
-
-    def _build_vless_outbound(self, profile: VlessProfile) -> dict[str, Any]:
-        outbound: dict[str, Any] = {
-            "type": "vless",
-            "tag": "proxy",
-            "server": profile.address,
-            "server_port": int(profile.port),
-            "uuid": profile.uuid,
-            "domain_resolver": "bootstrap-dns",
-        }
-
-        flow = self._param(profile, "flow")
-        if flow:
-            outbound["flow"] = flow
-
-        packet_encoding = self._param(profile, "packetEncoding", "packet_encoding")
-        if packet_encoding:
-            outbound["packet_encoding"] = packet_encoding
-
-        tls = self._build_tls(profile)
-        if tls:
-            outbound["tls"] = tls
-
-        transport = self._build_transport(profile)
-        if transport:
-            outbound["transport"] = transport
-
-        multiplex = self._build_multiplex(profile)
-        if multiplex:
-            outbound["multiplex"] = multiplex
-
-        return outbound
-
-    def build_latency_test_outbound(self, profile: VlessProfile, tag: str) -> dict[str, Any]:
-        """Собирает VLESS outbound с внешним tag для Karing-style delay API."""
-        outbound = self._build_vless_outbound(profile)
-        outbound["tag"] = tag
-        return outbound
-
-    def _build_tls(self, profile: VlessProfile) -> dict[str, Any] | None:
-        security = (self._param(profile, "security") or "none").lower()
-        if security not in {"tls", "reality"}:
-            return None
-
-        tls: dict[str, Any] = {"enabled": True}
-        server_name = self._param(profile, "sni", "serverName", "server_name") or profile.address
-        if server_name:
-            tls["server_name"] = server_name
-
-        alpn = _split_csv(self._param(profile, "alpn"))
-        if alpn:
-            tls["alpn"] = alpn
-
-        fingerprint = self._param(profile, "fp", "fingerprint")
-        if fingerprint:
-            tls["utls"] = {"enabled": True, "fingerprint": fingerprint}
-
-        if _truthy(self._param(profile, "allowInsecure", "allow_insecure", "insecure")):
-            tls["insecure"] = True
-
-        if security == "reality":
-            public_key = self._param(profile, "pbk", "publicKey", "public_key")
-            if not public_key:
-                raise ConfigBuildError("VLESS Reality требует параметр pbk/publicKey")
-            reality: dict[str, Any] = {"enabled": True, "public_key": public_key}
-            short_id = self._param(profile, "sid", "shortId", "short_id")
-            spider_x = self._param(profile, "spx", "spiderX", "spider_x")
-            if short_id:
-                reality["short_id"] = short_id
-            if spider_x:
-                reality["spider_x"] = spider_x
-            tls["reality"] = reality
-
-        return tls
-
-    def _build_transport(self, profile: VlessProfile) -> dict[str, Any] | None:
-        network = (self._param(profile, "type", "network") or "tcp").lower()
-        path = self._param(profile, "path")
-        host = self._param(profile, "host", "authority")
-
-        if network in {"tcp", "raw"}:
-            header_type = (self._param(profile, "headerType", "header_type") or "").lower()
-            if header_type == "http":
-                transport: dict[str, Any] = {"type": "http"}
-                if host:
-                    transport["host"] = _split_csv(host) or [host]
-                if path:
-                    transport["path"] = path
-                return transport
-            return None
-
-        if network in {"ws", "websocket"}:
-            transport = {"type": "ws"}
-            if path:
-                transport["path"] = path
-            if host:
-                transport["headers"] = {"Host": host}
-            return transport
-
-        if network in {"grpc", "gun"}:
-            service_name = self._param(profile, "serviceName", "service_name") or ""
-            return {"type": "grpc", "service_name": service_name}
-
-        if network in {"http", "h2"}:
-            transport = {"type": "http"}
-            if host:
-                transport["host"] = _split_csv(host) or [host]
-            if path:
-                transport["path"] = path
-            return transport
-
-        if network in {"quic"}:
-            return {"type": "quic"}
-
-        if network in {"httpupgrade", "http_upgrade"}:
-            transport = {"type": "httpupgrade"}
-            if host:
-                transport["host"] = host
-            if path:
-                transport["path"] = path
-            return transport
-
-        raise ConfigBuildError(f"Транспорт VLESS '{network}' пока не поддержан генератором sing-box")
-
-    def _build_multiplex(self, profile: VlessProfile) -> dict[str, Any] | None:
-        if not _truthy(self._param(profile, "mux", "multiplex")):
-            return None
-        protocol = self._param(profile, "muxProtocol", "mux_protocol") or "smux"
-        max_connections = self._param(profile, "muxMaxConnections", "mux_max_connections")
-        multiplex: dict[str, Any] = {"enabled": True, "protocol": protocol}
-        if max_connections and max_connections.isdigit():
-            multiplex["max_connections"] = int(max_connections)
-        return multiplex
+    def build_latency_test_outbound(self, profile: ServerProfile, tag: str) -> dict[str, Any]:
+        """Собирает outbound с внешним tag для Karing-style delay API."""
+        try:
+            return self.outbound_builder.build(profile, tag=tag)
+        except OutboundBuildError as exc:
+            raise ConfigBuildError(str(exc)) from exc
 
     def _build_dns(self, settings: AppSettings, split_rules: SplitRules) -> dict[str, Any]:
         configured = [str(item).strip() for item in settings.dns_servers if str(item).strip()]
@@ -251,35 +127,45 @@ class SingBoxConfigBuilder:
             self._build_dns_server(proxy_address, "proxy-dns", preferred_type="tcp", detour="proxy"),
         ]
         if settings.mode == "tun":
-            servers.append(
-                {
-                    "type": "fakeip",
-                    "tag": "fakeip",
-                    "inet4_range": "198.18.0.0/15",
-                    "inet6_range": "fc00::/18",
-                }
-            )
+            fakeip = {
+                "type": "fakeip",
+                "tag": "fakeip",
+                "inet4_range": "198.18.0.0/15",
+            }
+            if settings.enable_ipv6:
+                fakeip["inet6_range"] = "fc00::/18"
+            servers.append(fakeip)
         final_server = "bootstrap-dns" if split_rules.effective_default_outbound == ROUTE_OUTBOUND_DIRECT else "proxy-dns"
         return {
             "servers": servers,
             "rules": self._build_dns_rules(settings, split_rules),
             "final": final_server,
-            "strategy": "prefer_ipv4",
+            "strategy": normalize_dns_strategy(settings.dns_strategy, ipv6_enabled=settings.enable_ipv6),
             "reverse_mapping": True,
         }
 
     def _build_dns_rules(self, settings: AppSettings, split_rules: SplitRules) -> list[dict[str, Any]]:
         rules: list[dict[str, Any]] = []
         for rule_set in self._effective_rule_sets(split_rules):
-            selector = self._build_dns_rule_selector(rule_set, use_fakeip=settings.mode == "tun")
+            selector = self._build_dns_rule_selector(
+                rule_set,
+                use_fakeip=settings.mode == "tun",
+                enable_ipv6=settings.enable_ipv6,
+            )
             if selector:
                 rules.append(selector)
         if settings.mode == "tun":
             default_server = "fakeip" if split_rules.effective_default_outbound == ROUTE_OUTBOUND_PROXY else "bootstrap-dns"
-            rules.append({"query_type": ["A", "AAAA"], "action": "route", "server": default_server})
+            rules.append({"query_type": self._dns_query_types(settings), "action": "route", "server": default_server})
         return rules
 
-    def _build_dns_rule_selector(self, rule_set: RoutingRuleSet, use_fakeip: bool = False) -> dict[str, Any]:
+    def _build_dns_rule_selector(
+        self,
+        rule_set: RoutingRuleSet,
+        use_fakeip: bool = False,
+        *,
+        enable_ipv6: bool = True,
+    ) -> dict[str, Any]:
         outbound = normalize_outbound(rule_set.outbound)
         if use_fakeip and outbound == ROUTE_OUTBOUND_PROXY:
             server = "fakeip"
@@ -287,14 +173,22 @@ class SingBoxConfigBuilder:
             server = "proxy-dns" if outbound == ROUTE_OUTBOUND_PROXY else "bootstrap-dns"
         selector: dict[str, Any] = {"action": "route", "server": server}
         if server == "fakeip":
-            selector["query_type"] = ["A", "AAAA"]
+            selector["query_type"] = ["A", "AAAA"] if enable_ipv6 else ["A"]
         if rule_set.domains:
             selector["domain"] = sorted(set(rule_set.domains))
         if rule_set.domain_suffix:
             selector["domain_suffix"] = sorted(set(rule_set.domain_suffix))
         if rule_set.domain_keyword:
             selector["domain_keyword"] = sorted(set(rule_set.domain_keyword))
+        if rule_set.domain_regex:
+            selector["domain_regex"] = sorted(set(rule_set.domain_regex))
+        if rule_set.geosite:
+            selector["geosite"] = sorted(set(rule_set.geosite))
         return selector if len(selector) > 2 else {}
+
+    @staticmethod
+    def _dns_query_types(settings: AppSettings) -> list[str]:
+        return ["A", "AAAA"] if settings.enable_ipv6 else ["A"]
 
     def _build_dns_server(
         self,
@@ -386,11 +280,15 @@ class SingBoxConfigBuilder:
         if settings.mode == "proxy":
             return [mixed]
 
+        tun_addresses = [settings.tun_address]
+        if settings.enable_ipv6 and str(settings.tun_ipv6_address or "").strip():
+            tun_addresses.append(str(settings.tun_ipv6_address).strip())
+
         tun = {
             "type": "tun",
             "tag": "tun-in",
             "interface_name": settings.tun_interface_name,
-            "address": [settings.tun_address],
+            "address": tun_addresses,
             "mtu": self._tun_mtu(settings),
             "auto_route": True,
             "strict_route": bool(settings.kill_switch),
@@ -415,13 +313,17 @@ class SingBoxConfigBuilder:
             return min(max(1280, mtu), KARING_WINDOWS_TUN_MTU)
         return max(1280, mtu)
 
-    def _build_route_rules(self, split_rules: SplitRules) -> tuple[list[dict[str, Any]], str]:
+    def _build_route_rules(
+        self,
+        split_rules: SplitRules,
+        available_rule_set_tags: set[str],
+    ) -> tuple[list[dict[str, Any]], str]:
         rules: list[dict[str, Any]] = [
             {"action": "sniff"},
             {"protocol": "dns", "action": "hijack-dns"},
         ]
         for rule_set in self._effective_rule_sets(split_rules):
-            selector = self._build_rule_selector(rule_set)
+            selector = self._build_rule_selector(rule_set, available_rule_set_tags)
             if selector:
                 rules.append(selector)
         rules.append({"ip_is_private": True, "action": "route", "outbound": "direct"})
@@ -432,7 +334,44 @@ class SingBoxConfigBuilder:
         """Пользовательские правила имеют приоритет над встроенными bypass-правилами."""
         return [*split_rules.enabled_rule_sets, *builtin_direct_rule_sets()]
 
-    def _build_rule_selector(self, rule_set: RoutingRuleSet) -> dict[str, Any]:
+    def _build_route_rule_sets(self, split_rules: SplitRules) -> list[dict[str, Any]]:
+        return [self._build_route_rule_set(resource) for resource in split_rules.enabled_rule_set_resources]
+
+    def _build_route_rule_set(self, resource: RouteRuleSetResource) -> dict[str, Any]:
+        resource_type = normalize_rule_set_resource_type(resource.type)
+        tag = str(resource.tag or "").strip()
+        if not tag:
+            raise ConfigBuildError(f"У ruleset '{resource.name}' не задан tag")
+
+        result: dict[str, Any] = {"type": resource_type, "tag": tag}
+        if resource_type == "inline":
+            if not resource.rules:
+                raise ConfigBuildError(f"Inline ruleset '{resource.name}' пуст")
+            result["rules"] = resource.rules
+            return result
+
+        result["format"] = normalize_rule_set_resource_format(
+            resource.format,
+            resource.path or resource.url or resource.source,
+        )
+        if resource_type == "remote":
+            if not resource.url:
+                raise ConfigBuildError(f"Remote ruleset '{resource.name}' не содержит URL")
+            result["url"] = resource.url
+            if resource.update_interval:
+                result["update_interval"] = resource.update_interval
+            return result
+
+        if not resource.path:
+            raise ConfigBuildError(f"Local ruleset '{resource.name}' не содержит путь")
+        result["path"] = resource.path
+        return result
+
+    def _build_rule_selector(
+        self,
+        rule_set: RoutingRuleSet,
+        available_rule_set_tags: set[str],
+    ) -> dict[str, Any]:
         outbound = normalize_outbound(rule_set.outbound)
         if outbound not in ROUTE_OUTBOUNDS:
             raise ConfigBuildError(f"Неизвестный маршрут ruleset '{rule_set.name}'")
@@ -444,10 +383,29 @@ class SingBoxConfigBuilder:
             selector["domain_suffix"] = sorted(set(rule_set.domain_suffix))
         if rule_set.domain_keyword:
             selector["domain_keyword"] = sorted(set(rule_set.domain_keyword))
+        if rule_set.domain_regex:
+            selector["domain_regex"] = sorted(set(rule_set.domain_regex))
+        if rule_set.geosite:
+            selector["geosite"] = sorted(set(rule_set.geosite))
+        if rule_set.geoip:
+            selector["geoip"] = sorted(set(rule_set.geoip))
         if rule_set.ip_cidr:
             selector["ip_cidr"] = sorted(set(rule_set.ip_cidr))
-        if rule_set.process_name:
-            selector["process_name"] = sorted(set(rule_set.process_name))
-        if rule_set.process_path_regex:
-            selector["process_path_regex"] = sorted(set(rule_set.process_path_regex))
+        process_name = clean_process_names(rule_set.process_name)
+        if process_name:
+            selector["process_name"] = process_name
+        process_path = clean_process_paths(rule_set.process_path)
+        if process_path:
+            selector["process_path"] = process_path
+        process_path_regex = clean_process_path_regexes(rule_set.process_path_regex)
+        if process_path_regex:
+            selector["process_path_regex"] = process_path_regex
+        if rule_set.rule_set_tags:
+            rule_set_tags = sorted(set(rule_set.rule_set_tags))
+            missing = [tag for tag in rule_set_tags if tag not in available_rule_set_tags]
+            if missing:
+                raise ConfigBuildError(f"Ruleset '{rule_set.name}' ссылается на неизвестный route.rule_set: {', '.join(missing)}")
+            selector["rule_set"] = rule_set_tags
+            if rule_set.rule_set_ip_cidr_match_source:
+                selector["rule_set_ip_cidr_match_source"] = True
         return selector if len(selector) > 2 else {}

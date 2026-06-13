@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 6, 0),
-    prodvers=(1, 1, 6, 0),
+    filevers=(2, 0, 0, 0),
+    prodvers=(2, 0, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,11 +17,11 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'communism420'),
           StringStruct('FileDescription', 'Razreshenie VPN Client'),
-          StringStruct('FileVersion', '1.1.6'),
+          StringStruct('FileVersion', '2.0.0'),
           StringStruct('InternalName', 'Razreshenie VPN Client'),
           StringStruct('OriginalFilename', 'Razreshenie VPN Client.exe'),
           StringStruct('ProductName', 'Razreshenie VPN Client'),
-          StringStruct('ProductVersion', '1.1.6')
+          StringStruct('ProductVersion', '2.0.0')
         ]
       )
     ]),

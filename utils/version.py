@@ -19,7 +19,7 @@ from __future__ import annotations
 
 
 APP_NAME = "Razreshenie VPN Client"
-APP_VERSION = "1.1.6"
+APP_VERSION = "2.0.0"
 APP_REPOSITORY = "https://github.com/communism420/Razreshenie-VPN-Client"
 ZAPRET_KVN_REPOSITORY = "https://github.com/youtubediscord/zapret-kvn"
 RUSSIA_MOBILE_WHITELIST_REPOSITORY = "https://github.com/hxehex/russia-mobile-internet-whitelist"

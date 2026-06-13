@@ -13,22 +13,35 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 # GNU General Public License for more details.
 
-"""Импорт VLESS-подписок."""
+"""Импорт подписок с поддерживаемыми ссылками серверов."""
 
 from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import requests
 
-from core.vless_parser import VlessParseError, parse_vless_outbound, parse_vless_uri
+from core.server_parser import (
+    SUPPORTED_OUTBOUND_TYPES,
+    SUPPORTED_URI_SCHEMES,
+    ServerParseError,
+    is_supported_outbound_type,
+    parse_outbound,
+    parse_server_uri,
+)
+from core.subscription_formats import parse_subscription_payload
 from models.profile import Subscription, VlessProfile
+from utils import paths
 
 
 class SubscriptionError(ValueError):
@@ -45,109 +58,381 @@ REQUEST_HEADERS = {
 }
 
 
+@dataclass(slots=True)
+class _FetchResult:
+    profiles: list[VlessProfile]
+    payload: str
+    etag: str | None = None
+    last_modified: str | None = None
+    from_cache: bool = False
+    label: str = "primary"
+
+
+@dataclass(frozen=True, slots=True)
+class ImportProgress:
+    current: int
+    total: int
+    source: str
+    imported: int
+    errors: int = 0
+
+
+ProgressCallback = Callable[[ImportProgress], None]
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionFetchProgress:
+    current: int
+    total: int
+    subscription: Subscription
+    updated: int
+    errors: int = 0
+
+
+@dataclass(slots=True)
+class SubscriptionFetchResult:
+    subscription: Subscription
+    profiles: list[VlessProfile] = field(default_factory=list)
+    error: str | None = None
+
+    @property
+    def success(self) -> bool:
+        return self.error is None
+
+
+SubscriptionProgressCallback = Callable[[SubscriptionFetchProgress], None]
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 class SubscriptionManager:
+    def fetch_many(
+        self,
+        subscriptions: Iterable[Subscription],
+        *,
+        max_workers: int = 3,
+        progress_callback: SubscriptionProgressCallback | None = None,
+    ) -> list[SubscriptionFetchResult]:
+        items = list(subscriptions)
+        if not items:
+            return []
+
+        results: list[SubscriptionFetchResult] = []
+        total = len(items)
+        completed = 0
+        errors = 0
+        worker_count = max(1, min(max_workers, total))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="SubscriptionBatch") as executor:
+            future_map = {executor.submit(self.fetch, subscription): subscription for subscription in items}
+            for future in as_completed(future_map):
+                subscription = future_map[future]
+                try:
+                    profiles, updated_subscription = future.result()
+                except Exception as exc:
+                    message = str(exc)
+                    subscription.last_error = message
+                    result = SubscriptionFetchResult(subscription=subscription, error=message)
+                    errors += 1
+                else:
+                    result = SubscriptionFetchResult(subscription=updated_subscription, profiles=profiles)
+                results.append(result)
+                completed += 1
+                if progress_callback:
+                    progress_callback(
+                        SubscriptionFetchProgress(
+                            current=completed,
+                            total=total,
+                            subscription=result.subscription,
+                            updated=sum(1 for item in results if item.success),
+                            errors=errors,
+                        )
+                    )
+        return results
+
     def fetch(self, subscription: Subscription) -> tuple[list[VlessProfile], Subscription]:
-        best_profiles: list[VlessProfile] = []
+        best_result: _FetchResult | None = None
         errors: list[str] = []
         expected_count = max(0, int(subscription.profile_count or 0))
 
         try:
-            best_profiles = self._fetch_once(subscription)
+            best_result = self._fetch_once(subscription, label="primary", conditional=True)
         except (requests.RequestException, SubscriptionError) as exc:
             errors.append(str(exc))
 
-        if best_profiles and (not expected_count or len(best_profiles) >= expected_count):
-            return self._finish_fetch(subscription, best_profiles)
+        if best_result and (not expected_count or len(best_result.profiles) >= expected_count):
+            return self._finish_fetch(subscription, best_result)
 
         # Повторные запросы нужны только против временно неполного ответа.
         # Они идут параллельно, а не последовательно, и не суммируются между
         # собой: берем один самый полный снимок подписки.
         retry_count = FETCH_ATTEMPTS - 1
         if retry_count > 0:
-            retry_profiles = self._fetch_retries(subscription, retry_count, errors)
-            if len(retry_profiles) > len(best_profiles):
-                best_profiles = retry_profiles
+            retry_results = self._fetch_retries(subscription, retry_count, errors)
+            for retry_result in retry_results:
+                best_result = self._choose_better_result(best_result, retry_result)
 
-        if not best_profiles:
+        cached = self._fetch_from_cache(subscription, label="last-good")
+        if cached:
+            best_result = self._choose_better_result(best_result, cached)
+
+        if not best_result:
             message = errors[-1] if errors else "пустой ответ"
             subscription.last_error = message
             raise SubscriptionError(f"Не удалось загрузить подписку: {message}")
 
-        return self._finish_fetch(subscription, best_profiles)
+        return self._finish_fetch(subscription, best_result)
 
-    def _fetch_once(self, subscription: Subscription) -> list[VlessProfile]:
+    def _fetch_once(
+        self,
+        subscription: Subscription,
+        *,
+        label: str,
+        conditional: bool = False,
+        no_cache: bool = False,
+    ) -> _FetchResult:
+        headers = dict(REQUEST_HEADERS)
+        if conditional:
+            if subscription.etag:
+                headers["If-None-Match"] = subscription.etag
+            if subscription.last_modified:
+                headers["If-Modified-Since"] = subscription.last_modified
+        if no_cache:
+            headers["Cache-Control"] = "no-cache, no-store"
+            headers["Pragma"] = "no-cache"
         response = requests.get(
             subscription.url,
             timeout=FETCH_TIMEOUT_SECONDS,
-            headers=REQUEST_HEADERS,
+            headers=headers,
         )
+        if response.status_code == 304:
+            cached = self._fetch_from_cache(subscription, label=f"{label}-304")
+            if cached:
+                cached.etag = subscription.etag
+                cached.last_modified = subscription.last_modified
+                return cached
+            raise SubscriptionError("сервер вернул 304, но локальный кэш пуст")
         response.raise_for_status()
-        return self.parse_text(response.text, subscription.id)
+        payload = response.text
+        return _FetchResult(
+            profiles=self.parse_text(payload, subscription.id),
+            payload=payload,
+            etag=response.headers.get("ETag") or subscription.etag,
+            last_modified=response.headers.get("Last-Modified") or subscription.last_modified,
+            from_cache=False,
+            label=label,
+        )
 
     def _fetch_retries(
         self,
         subscription: Subscription,
         retry_count: int,
         errors: list[str],
-    ) -> list[VlessProfile]:
-        best_profiles: list[VlessProfile] = []
+    ) -> list[_FetchResult]:
+        results: list[_FetchResult] = []
+        variants = [
+            {"label": "retry-direct", "conditional": False, "no_cache": False},
+            {"label": "retry-no-cache", "conditional": False, "no_cache": True},
+        ][:retry_count]
         with ThreadPoolExecutor(max_workers=max(1, retry_count), thread_name_prefix="SubscriptionFetch") as executor:
-            futures = [executor.submit(self._fetch_once, subscription) for _ in range(retry_count)]
+            futures = [
+                executor.submit(self._fetch_once, subscription, **variant)
+                for variant in variants
+            ]
             for future in as_completed(futures):
                 try:
-                    fetched_profiles = future.result()
+                    fetched_result = future.result()
                 except (requests.RequestException, SubscriptionError) as exc:
                     errors.append(str(exc))
                     continue
-                if len(fetched_profiles) > len(best_profiles):
-                    best_profiles = fetched_profiles
-        return best_profiles
+                results.append(fetched_result)
+        return results
+
+    def _choose_better_result(
+        self,
+        current: _FetchResult | None,
+        candidate: _FetchResult,
+    ) -> _FetchResult:
+        if current is None:
+            return candidate
+        if len(candidate.profiles) != len(current.profiles):
+            return candidate if len(candidate.profiles) > len(current.profiles) else current
+        if candidate.from_cache != current.from_cache:
+            return current if current.from_cache is False else candidate
+        if len(candidate.payload) > len(current.payload):
+            return candidate
+        return current
+
+    def _fetch_from_cache(self, subscription: Subscription, *, label: str) -> _FetchResult | None:
+        try:
+            payload = self._cache_path(subscription).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+        if not payload.strip():
+            return None
+        try:
+            profiles = self.parse_text(payload, subscription.id)
+        except SubscriptionError:
+            return None
+        return _FetchResult(
+            profiles=profiles,
+            payload=payload,
+            etag=subscription.etag,
+            last_modified=subscription.last_modified,
+            from_cache=True,
+            label=label,
+        )
+
+    def _write_cache(self, subscription: Subscription, payload: str) -> None:
+        if not payload.strip():
+            return
+        try:
+            cache_path = self._cache_path(subscription)
+            tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            tmp_path.write_text(payload, encoding="utf-8")
+            tmp_path.replace(cache_path)
+        except OSError:
+            return
+        subscription.last_cached_at = _utc_now()
+
+    def _cache_path(self, subscription: Subscription) -> Path:
+        source = subscription.id or subscription.url or subscription.name
+        digest = hashlib.sha256(source.encode("utf-8", errors="replace")).hexdigest()[:32]
+        return self._cache_dir() / f"{digest}.txt"
 
     @staticmethod
+    def _cache_dir() -> Path:
+        cache_dir = paths.ensure_app_dirs()["downloads"] / "subscription-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
     def _finish_fetch(
+        self,
         subscription: Subscription,
-        profiles: list[VlessProfile],
+        result: _FetchResult,
     ) -> tuple[list[VlessProfile], Subscription]:
         subscription.last_update_at = _utc_now()
         subscription.last_error = None
-        subscription.profile_count = len(profiles)
-        return profiles, subscription
+        subscription.profile_count = len(result.profiles)
+        if result.etag:
+            subscription.etag = result.etag
+        if result.last_modified:
+            subscription.last_modified = result.last_modified
+        if result.payload:
+            subscription.last_content_hash = hashlib.sha256(result.payload.encode("utf-8", errors="replace")).hexdigest()
+            if not result.from_cache:
+                self._write_cache(subscription, result.payload)
+        return result.profiles, subscription
 
     def parse_text(self, text: str, subscription_id: str | None = None) -> list[VlessProfile]:
         payload = self._decode_if_base64(text)
-        profiles: list[VlessProfile] = []
-        errors: list[str] = []
+        parsed = parse_subscription_payload(payload, subscription_id)
+        profiles: list[VlessProfile] = list(parsed.profiles)
+        errors: list[str] = list(parsed.errors)
 
-        json_outbounds = self._extract_json_vless_outbounds(payload)
+        if profiles and parsed.format_name != "text":
+            return self._append_duplicate_name_suffixes(profiles)
+
+        json_outbounds = self._extract_json_outbounds(payload)
         json_links = self._extract_json_links(payload)
 
         for outbound in json_outbounds:
             try:
-                profile = parse_vless_outbound(outbound, subscription_id=subscription_id)
+                profile = parse_outbound(outbound, subscription_id=subscription_id)
                 profiles.append(profile)
-            except VlessParseError as exc:
+            except ServerParseError as exc:
                 errors.append(str(exc))
 
         # Karing считает каждую запись подписки отдельным сервером, даже если
-        # провайдер повторил один и тот же VLESS-ключ несколько раз. Поэтому
-        # здесь намеренно нет дедупликации по endpoint/name/params.
+        # провайдер повторил один и тот же ключ несколько раз. Поэтому здесь
+        # намеренно нет дедупликации по endpoint/name/params.
         links = json_links if json_outbounds or json_links else self._extract_links(payload)
         for link in links:
             try:
-                profile = parse_vless_uri(link, subscription_id=subscription_id)
-            except VlessParseError as exc:
+                profile = parse_server_uri(link, subscription_id=subscription_id)
+            except ServerParseError as exc:
                 errors.append(str(exc))
                 continue
             profiles.append(profile)
 
         if not profiles:
             details = f": {'; '.join(errors[:3])}" if errors else ""
-            raise SubscriptionError(f"В подписке не найдено корректных VLESS-ключей{details}")
+            raise SubscriptionError(f"В подписке не найдено корректных серверов{details}")
         return self._append_duplicate_name_suffixes(profiles)
+
+    def parse_many(
+        self,
+        sources: Iterable[tuple[str, str]],
+        subscription_id: str | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> list[VlessProfile]:
+        source_items = list(sources)
+        all_profiles: list[VlessProfile] = []
+        errors: list[str] = []
+        total = len(source_items)
+
+        for index, (source, text) in enumerate(source_items, start=1):
+            source_name = str(source or f"source-{index}")
+            try:
+                profiles = self.parse_text(str(text or ""), subscription_id)
+            except SubscriptionError as exc:
+                errors.append(f"{source_name}: {exc}")
+            else:
+                all_profiles.extend(profiles)
+            if progress_callback:
+                progress_callback(
+                    ImportProgress(
+                        current=index,
+                        total=total,
+                        source=source_name,
+                        imported=len(all_profiles),
+                        errors=len(errors),
+                    )
+                )
+
+        if not all_profiles:
+            details = f": {'; '.join(errors[:3])}" if errors else ""
+            raise SubscriptionError(f"Не удалось импортировать серверы{details}")
+        return self._append_duplicate_name_suffixes(all_profiles)
+
+    def parse_files(
+        self,
+        file_paths: Iterable[str | Path],
+        subscription_id: str | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> list[VlessProfile]:
+        path_items = [Path(path) for path in file_paths]
+        all_profiles: list[VlessProfile] = []
+        errors: list[str] = []
+        total = len(path_items)
+
+        for index, file_path in enumerate(path_items, start=1):
+            source_name = str(file_path)
+            try:
+                text = file_path.read_text(encoding="utf-8-sig")
+                profiles = self.parse_text(text, subscription_id)
+            except (OSError, UnicodeError, SubscriptionError) as exc:
+                errors.append(f"{source_name}: {exc}")
+            else:
+                all_profiles.extend(profiles)
+            if progress_callback:
+                progress_callback(
+                    ImportProgress(
+                        current=index,
+                        total=total,
+                        source=source_name,
+                        imported=len(all_profiles),
+                        errors=len(errors),
+                    )
+                )
+
+        if not all_profiles:
+            details = f": {'; '.join(errors[:3])}" if errors else ""
+            raise SubscriptionError(f"Не удалось импортировать файлы{details}")
+        return self._append_duplicate_name_suffixes(all_profiles)
 
     @staticmethod
     def _append_duplicate_name_suffixes(profiles: list[VlessProfile]) -> list[VlessProfile]:
@@ -207,10 +492,11 @@ class SubscriptionManager:
 
     def _extract_links(self, text: str) -> list[str]:
         links: list[str] = []
-        pattern = re.compile(r"(?i)(vless|vmess|trojan|ss|ssr|hysteria2|hy2)://")
+        schemes = "|".join(sorted(re.escape(item) for item in SUPPORTED_URI_SCHEMES))
+        pattern = re.compile(rf"(?i)({schemes}|ssr)://")
         matches = list(pattern.finditer(text))
         for index, match in enumerate(matches):
-            if match.group(1).lower() != "vless":
+            if match.group(1).lower() not in SUPPORTED_URI_SCHEMES:
                 continue
             start = match.start()
             end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
@@ -223,7 +509,7 @@ class SubscriptionManager:
                 links.append(link)
         return links
 
-    def _extract_json_vless_outbounds(self, text: str) -> list[dict[str, Any]]:
+    def _extract_json_outbounds(self, text: str) -> list[dict[str, Any]]:
         try:
             payload = json.loads(text)
         except (TypeError, json.JSONDecodeError):
@@ -231,7 +517,7 @@ class SubscriptionManager:
 
         outbounds: list[dict[str, Any]] = []
         for item in self._walk_json(payload):
-            if isinstance(item, dict) and str(item.get("type") or "").lower() == "vless":
+            if isinstance(item, dict) and is_supported_outbound_type(item.get("type")):
                 outbounds.append(item)
         return outbounds
 
@@ -243,7 +529,7 @@ class SubscriptionManager:
 
         links: list[str] = []
         for item in self._walk_json(payload):
-            if isinstance(item, str) and "vless://" in item.lower():
+            if isinstance(item, str) and self._contains_supported_uri(item):
                 links.extend(self._extract_links(item))
         return links
 
@@ -254,21 +540,22 @@ class SubscriptionManager:
             item = stack.pop()
             result.append(item)
             if isinstance(item, dict):
-                stack.extend(item.values())
+                stack.extend(reversed(list(item.values())))
             elif isinstance(item, list):
-                stack.extend(item)
+                stack.extend(reversed(item))
         return result
 
     @staticmethod
     def _looks_like_subscription(text: str) -> bool:
         stripped = text.strip()
-        if "vless://" in stripped.lower():
+        if SubscriptionManager._contains_supported_uri(stripped):
             return True
         if not stripped:
             return False
         if stripped[0] in "[{":
             lowered = stripped.lower()
-            return '"outbounds"' in lowered or '"proxies"' in lowered or '"type"' in lowered and '"vless"' in lowered
+            has_supported_type = any(f'"{protocol}"' in lowered for protocol in SUPPORTED_OUTBOUND_TYPES)
+            return '"outbounds"' in lowered or '"proxies"' in lowered or '"type"' in lowered and has_supported_type
         return False
 
     @staticmethod
@@ -285,3 +572,8 @@ class SubscriptionManager:
         params = "&".join(f"{key.lower()}={value}" for key, value in sorted(profile.params.items()))
         name = " ".join(profile.name.lower().split())
         return f"{profile.protocol}|{name}|{profile.address.lower()}|{profile.port}|{profile.uuid.lower()}|{params}"
+
+    @staticmethod
+    def _contains_supported_uri(text: str) -> bool:
+        lowered = str(text or "").lower()
+        return any(f"{scheme}://" in lowered for scheme in SUPPORTED_URI_SCHEMES)

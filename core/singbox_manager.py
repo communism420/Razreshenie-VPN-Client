@@ -34,8 +34,16 @@ from typing import Any
 
 import requests
 
+from core.connectivity import (
+    ConnectivityCheckResult,
+    ConnectivityProbeResult,
+    DEFAULT_CONNECTIVITY_CHECK_URLS,
+    is_successful_connectivity_status,
+    normalize_connectivity_timeout_ms,
+    normalize_connectivity_urls,
+)
 from core.config_builder import ConfigBuildError, SingBoxConfigBuilder
-from models.profile import VlessProfile
+from models.profile import ServerProfile
 from models.rules import SplitRules
 from models.settings import AppSettings
 from utils import paths
@@ -51,7 +59,7 @@ class SingBoxError(RuntimeError):
 class _ConnectionPlan:
     """Подготовленный Karing-style план запуска: config уже собран и проверен."""
 
-    profile: VlessProfile
+    profile: ServerProfile
     settings: AppSettings
     executable: Path
     config_path: Path
@@ -62,15 +70,7 @@ class _ConnectionPlan:
 
 class SingBoxManager:
     RELEASE_API = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-    CONNECTIVITY_TEST_URLS = (
-        "https://www.gstatic.com/generate_204",
-        "http://www.msftconnecttest.com/connecttest.txt",
-        "http://cp.cloudflare.com/generate_204",
-        "https://checkip.amazonaws.com",
-        "http://connectivity-check.ubuntu.com",
-        "http://detectportal.firefox.com/success.txt",
-        "http://connectivitycheck.gstatic.com/generate_204",
-    )
+    CONNECTIVITY_TEST_URLS = DEFAULT_CONNECTIVITY_CHECK_URLS
     SERVER_REACHABILITY_TIMEOUT = 4.0
     CORE_CONNECTIVITY_TIMEOUT = 10.0
 
@@ -86,6 +86,7 @@ class SingBoxManager:
         self._active_tun_interface: str | None = None
         self._active_fingerprint: str | None = None
         self._active_profile_name: str | None = None
+        self._active_clash_api_port: int | None = None
         self._connection_state = "disconnected"
         self._connected_at: float | None = None
 
@@ -110,6 +111,36 @@ class SingBoxManager:
     @property
     def connection_state(self) -> str:
         return self._connection_state
+
+    def last_runtime_error(self) -> str:
+        """Возвращает компактную причину последнего неожиданного завершения core."""
+        with self._lock:
+            return self._unexpected_exit_message(startup=False)
+
+    def mark_stopped_if_exited(self) -> None:
+        """Синхронизирует состояние, если процесс уже завершился сам."""
+        with self._lock:
+            if self.process and self.process.poll() is not None:
+                self.process = None
+                self._mark_disconnected()
+
+    def check_current_connectivity(self, settings: AppSettings) -> ConnectivityCheckResult:
+        """Checks the currently running sing-box instance using its active Clash API when available."""
+        with self._lock:
+            if not self.is_running():
+                return ConnectivityCheckResult(
+                    success=False,
+                    attempts=[
+                        ConnectivityProbeResult(
+                            url="sing-box",
+                            success=False,
+                            error=self._unexpected_exit_message(startup=False),
+                            via="process",
+                        )
+                    ],
+                )
+            clash_api_port = self._active_clash_api_port
+        return self._check_core_connectivity_once_result(settings, clash_api_port)
 
     def ensure_binary(self) -> Path:
         exe = self.executable_path
@@ -185,7 +216,7 @@ class SingBoxManager:
 
     def build_and_save_config(
         self,
-        profile: VlessProfile,
+        profile: ServerProfile,
         settings: AppSettings,
         split_rules: SplitRules,
     ) -> Path:
@@ -195,7 +226,7 @@ class SingBoxManager:
 
     def _build_config(
         self,
-        profile: VlessProfile,
+        profile: ServerProfile,
         settings: AppSettings,
         split_rules: SplitRules,
     ) -> dict[str, Any]:
@@ -223,7 +254,7 @@ class SingBoxManager:
         output = "\n".join(part for part in (proc.stdout.strip(), proc.stderr.strip()) if part)
         return proc.returncode == 0, output or "config OK"
 
-    def start(self, profile: VlessProfile, settings: AppSettings, split_rules: SplitRules) -> None:
+    def start(self, profile: ServerProfile, settings: AppSettings, split_rules: SplitRules) -> None:
         with self._lock:
             fingerprint = self._connection_fingerprint(profile, settings, split_rules)
             running = self.is_running()
@@ -252,7 +283,7 @@ class SingBoxManager:
 
     def _prepare_connection_plan(
         self,
-        profile: VlessProfile,
+        profile: ServerProfile,
         settings: AppSettings,
         split_rules: SplitRules,
         fingerprint: str,
@@ -333,7 +364,7 @@ class SingBoxManager:
             if settings.mode != "tun":
                 if self._wait_until_proxy_ready(settings.mixed_listen_host, int(settings.mixed_port), max_wait=3.0):
                     self._wait_until_clash_api_ready(plan.clash_api_port, max_wait=1.0)
-                    self._mark_connected(plan.profile, plan.fingerprint)
+                    self._mark_connected(plan.profile, plan.fingerprint, plan.clash_api_port)
                     self._start_background_health_check(plan)
                     return
                 exited = self.process is None or self.process.poll() is not None
@@ -361,7 +392,7 @@ class SingBoxManager:
                 self.logger.warning(
                     "sing-box запустился, но Clash API не ответил сразу; продолжаю запуск как Karing-style service start"
                 )
-            self._mark_connected(plan.profile, plan.fingerprint)
+            self._mark_connected(plan.profile, plan.fingerprint, plan.clash_api_port)
             self._start_background_health_check(plan)
             self._start_post_connect_tasks(settings)
             return
@@ -422,9 +453,10 @@ class SingBoxManager:
         with self._output_lock:
             return list(self._last_output_lines)
 
-    def _mark_connected(self, profile: VlessProfile, fingerprint: str) -> None:
+    def _mark_connected(self, profile: ServerProfile, fingerprint: str, clash_api_port: int | None) -> None:
         self._active_fingerprint = fingerprint
         self._active_profile_name = profile.name
+        self._active_clash_api_port = clash_api_port
         self._connection_state = "connected"
         self._connected_at = time.monotonic()
         self.logger.info("Подключение активно: %s", profile.name)
@@ -433,6 +465,7 @@ class SingBoxManager:
         self._active_tun_interface = None
         self._active_fingerprint = None
         self._active_profile_name = None
+        self._active_clash_api_port = None
         self._connection_state = "disconnected"
         self._connected_at = None
 
@@ -472,7 +505,7 @@ class SingBoxManager:
 
     def _connection_fingerprint(
         self,
-        profile: VlessProfile,
+        profile: ServerProfile,
         settings: AppSettings,
         split_rules: SplitRules,
     ) -> str:
@@ -527,11 +560,11 @@ class SingBoxManager:
         while time.monotonic() < deadline:
             if not self.process or self.process.poll() is not None:
                 return False, self._unexpected_exit_message(startup=True)
-            ok, error = self._check_core_connectivity_once(settings, clash_api_port)
-            if ok:
-                self.logger.info("Проверка подключения через текущий сервер прошла успешно")
+            result = self._check_core_connectivity_once_result(settings, clash_api_port)
+            if result.success:
+                self.logger.info("Проверка подключения через текущий сервер прошла успешно: %s", result.summary)
                 return True, ""
-            last_error = error
+            last_error = result.error
             time.sleep(0.35)
         return False, (
             "sing-box запустился, но проверка выхода через текущий сервер не прошла. "
@@ -569,45 +602,102 @@ class SingBoxManager:
         settings: AppSettings,
         clash_api_port: int | None = None,
     ) -> tuple[bool, str]:
+        result = self._check_core_connectivity_once_result(settings, clash_api_port)
+        return result.success, result.error
+
+    def _check_core_connectivity_once_result(
+        self,
+        settings: AppSettings,
+        clash_api_port: int | None = None,
+    ) -> ConnectivityCheckResult:
         session = requests.Session()
         session.trust_env = False
+        urls = normalize_connectivity_urls(settings.connectivity_check_urls)
+        timeout_ms = normalize_connectivity_timeout_ms(settings.connectivity_check_timeout_ms)
+        timeout_seconds = max(1.0, timeout_ms / 1000.0)
+        attempts: list[ConnectivityProbeResult] = []
+
         if clash_api_port:
             api_url = f"http://127.0.0.1:{int(clash_api_port)}/proxies/proxy/delay"
-            try:
-                response = session.get(
-                    api_url,
-                    params={"url": self.CONNECTIVITY_TEST_URLS[0], "timeout": 5000},
-                    timeout=(1.0, 6.0),
-                    headers={"User-Agent": self._user_agent()},
-                )
-                if response.status_code == 200:
-                    delay = response.json().get("delay")
-                    if int(delay) >= 0:
-                        return True, ""
-                    return False, f"Clash API delay вернул некорректное значение: {delay}"
-                return False, f"Clash API delay: HTTP {response.status_code}"
-            except (requests.RequestException, ValueError, TypeError) as exc:
-                return False, f"Clash API delay: {exc}"
+            for url in urls:
+                try:
+                    response = session.get(
+                        api_url,
+                        params={"url": url, "timeout": timeout_ms},
+                        timeout=(1.0, timeout_seconds + 1.0),
+                        headers={"User-Agent": self._user_agent()},
+                    )
+                    if response.status_code == 200:
+                        delay = response.json().get("delay")
+                        latency = int(delay)
+                        if latency >= 0:
+                            attempt = ConnectivityProbeResult(url=url, success=True, latency_ms=latency, via="clash")
+                            return ConnectivityCheckResult(success=True, attempts=[*attempts, attempt])
+                        attempts.append(
+                            ConnectivityProbeResult(
+                                url=url,
+                                success=False,
+                                status_code=response.status_code,
+                                error=f"{url}: Clash API delay вернул некорректное значение: {delay}",
+                                via="clash",
+                            )
+                        )
+                        continue
+                    attempts.append(
+                        ConnectivityProbeResult(
+                            url=url,
+                            success=False,
+                            status_code=response.status_code,
+                            error=f"{url}: Clash API delay HTTP {response.status_code}",
+                            via="clash",
+                        )
+                    )
+                except (requests.RequestException, ValueError, TypeError) as exc:
+                    attempts.append(
+                        ConnectivityProbeResult(
+                            url=url,
+                            success=False,
+                            error=f"{url}: Clash API delay: {exc}",
+                            via="clash",
+                        )
+                    )
 
         proxy_url = f"http://{self._connect_host(settings.mixed_listen_host)}:{int(settings.mixed_port)}"
         proxies = {"http": proxy_url, "https": proxy_url} if settings.mode == "proxy" else None
-        last_error = ""
-        for url in self.CONNECTIVITY_TEST_URLS:
+        for url in urls:
+            started = time.perf_counter()
             try:
                 response = session.get(
                     url,
-                    timeout=(1.5, 2.0),
+                    timeout=(1.5, min(timeout_seconds, 8.0)),
                     allow_redirects=False,
                     proxies=proxies,
                     headers={"User-Agent": self._user_agent()},
                 )
             except requests.RequestException as exc:
-                last_error = f"{url}: {exc}"
+                attempts.append(ConnectivityProbeResult(url=url, success=False, error=f"{url}: {exc}", via="http"))
                 continue
-            if 200 <= response.status_code < 400:
-                return True, ""
-            last_error = f"{url}: HTTP {response.status_code}"
-        return False, last_error or "нет ответа от проверочных URL"
+            latency_ms = max(1, int((time.perf_counter() - started) * 1000))
+            if is_successful_connectivity_status(response.status_code):
+                attempt = ConnectivityProbeResult(
+                    url=url,
+                    success=True,
+                    latency_ms=latency_ms,
+                    status_code=response.status_code,
+                    via="http",
+                )
+                return ConnectivityCheckResult(success=True, attempts=[*attempts, attempt])
+            attempts.append(
+                ConnectivityProbeResult(
+                    url=url,
+                    success=False,
+                    latency_ms=latency_ms,
+                    status_code=response.status_code,
+                    error=f"{url}: HTTP {response.status_code}",
+                    via="http",
+                )
+            )
+        return ConnectivityCheckResult(success=False, attempts=attempts)
 
     @staticmethod
     def _reserve_local_port() -> int:
@@ -661,7 +751,7 @@ class SingBoxManager:
             return
 
     @staticmethod
-    def _preflight_profile(profile: VlessProfile) -> None:
+    def _preflight_profile(profile: ServerProfile) -> None:
         if not str(profile.address or "").strip():
             raise SingBoxError("У выбранного профиля не указан адрес сервера")
         try:
@@ -670,10 +760,10 @@ class SingBoxManager:
             raise SingBoxError("У выбранного профиля указан некорректный порт") from exc
         if port <= 0 or port > 65535:
             raise SingBoxError("У выбранного профиля порт вне диапазона 1-65535")
-        if not str(profile.uuid or "").strip():
-            raise SingBoxError("У выбранного профиля не указан UUID")
+        if not str(profile.protocol or "").strip():
+            raise SingBoxError("У выбранного профиля не указан протокол")
 
-    def _preflight_server_reachability(self, profile: VlessProfile) -> None:
+    def _preflight_server_reachability(self, profile: ServerProfile) -> None:
         if self._profile_uses_udp_transport(profile):
             self.logger.info("Профиль использует UDP/QUIC transport, TCP preflight сервера пропущен")
             return
@@ -690,7 +780,9 @@ class SingBoxManager:
             ) from exc
 
     @staticmethod
-    def _profile_uses_udp_transport(profile: VlessProfile) -> bool:
+    def _profile_uses_udp_transport(profile: ServerProfile) -> bool:
+        if str(profile.protocol or "").lower() in {"hysteria2", "tuic", "wireguard"}:
+            return True
         params = {key.lower(): str(value).lower() for key, value in profile.params.items()}
         network = params.get("type") or params.get("network") or "tcp"
         return network == "quic"

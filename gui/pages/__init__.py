@@ -13,16 +13,4 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 # GNU General Public License for more details.
 
-"""Совместимая обертка над универсальным импортом серверов."""
-
-from __future__ import annotations
-
-from core.server_parser import (
-    ServerParseError,
-    get_karing_server_name,
-    parse_vless_outbound,
-    parse_vless_uri,
-)
-
-
-VlessParseError = ServerParseError
+"""Страницы PyQt6 GUI."""

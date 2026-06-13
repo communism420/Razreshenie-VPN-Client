@@ -105,3 +105,11 @@ def subscriptions_path() -> Path:
 
 def rules_path() -> Path:
     return ensure_app_dirs()["rules"] / "split-rules.json"
+
+
+def quality_stats_path() -> Path:
+    return ensure_app_dirs()["data"] / "quality-stats.json"
+
+
+def smart_groups_path() -> Path:
+    return ensure_app_dirs()["data"] / "smart-groups.json"

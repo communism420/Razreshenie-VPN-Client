@@ -33,22 +33,20 @@ from urllib.parse import quote
 
 import requests
 
+from core.connectivity import (
+    DEFAULT_CONNECTIVITY_CHECK_URLS,
+    normalize_connectivity_timeout_ms,
+    normalize_connectivity_urls,
+)
 from core.config_builder import ConfigBuildError, SingBoxConfigBuilder
-from models.profile import VlessProfile
+from models.profile import ServerProfile
 from models.settings import AppSettings
 from utils import paths
 from utils.network import measure_server_latency_ms
 from utils.storage import read_json, write_json
 
 
-KARING_URL_TEST_LIST = (
-    "https://www.gstatic.com/generate_204",
-    "http://www.msftconnecttest.com/connecttest.txt",
-    "http://cp.cloudflare.com/generate_204",
-    "https://checkip.amazonaws.com",
-    "http://connectivity-check.ubuntu.com",
-    "http://detectportal.firefox.com/success.txt",
-)
+KARING_URL_TEST_LIST = DEFAULT_CONNECTIVITY_CHECK_URLS
 KARING_URL_TEST_TIMEOUT_SECONDS = 15
 KARING_LATENCY_MAX_CONCURRENCY = 20
 KARING_LATENCY_CONTROL_HOST = "127.0.0.1"
@@ -71,7 +69,7 @@ class LatencyTarget:
     port: int
 
     @classmethod
-    def from_profile(cls, profile: VlessProfile) -> "LatencyTarget":
+    def from_profile(cls, profile: ServerProfile) -> "LatencyTarget":
         try:
             port = int(profile.port or 0)
         except (TypeError, ValueError):
@@ -95,6 +93,14 @@ class LatencyScanSummary:
     @property
     def timeout_profiles(self) -> int:
         return max(0, self.total_profiles - self.successful_profiles)
+
+
+@dataclass(frozen=True, slots=True)
+class LatencyScanResult:
+    """Синхронный результат Karing-style проверки отклика."""
+
+    results: dict[str, int | None]
+    summary: LatencyScanSummary
 
 
 class LatencyScanner:
@@ -131,7 +137,7 @@ class LatencyScanner:
 
     def scan_profiles(
         self,
-        profiles: Iterable[VlessProfile],
+        profiles: Iterable[ServerProfile],
         *,
         settings: AppSettings | None = None,
         on_batch: LatencyBatchCallback,
@@ -156,6 +162,32 @@ class LatencyScanner:
         )
         self._thread.start()
         return True
+
+    def scan_profiles_sync(
+        self,
+        profiles: Iterable[ServerProfile],
+        *,
+        settings: AppSettings | None = None,
+    ) -> LatencyScanResult:
+        """Синхронная проверка профилей для фоновых Smart Connect worker'ов."""
+        with self._lock:
+            if self._running:
+                raise RuntimeError("Проверка отклика уже выполняется")
+            self._running = True
+            self._cancel_event.clear()
+
+        batches: list[tuple[str, int | None]] = []
+        try:
+            profile_snapshot = tuple(ServerProfile.from_dict(profile.to_dict()) for profile in profiles)
+
+            def on_batch(batch: LatencyBatch) -> None:
+                batches.extend(batch)
+
+            summary = self._scan_profiles(profile_snapshot, settings or AppSettings(), on_batch)
+            return LatencyScanResult(results=dict(batches), summary=summary)
+        finally:
+            with self._lock:
+                self._running = False
 
     def scan_targets(
         self,
@@ -204,14 +236,14 @@ class LatencyScanner:
 
     def _run_profile_scan(
         self,
-        profiles: Iterable[VlessProfile],
+        profiles: Iterable[ServerProfile],
         settings: AppSettings,
         on_batch: LatencyBatchCallback,
         on_done: LatencyDoneCallback,
         on_error: LatencyErrorCallback,
     ) -> None:
         try:
-            profile_snapshot = tuple(VlessProfile.from_dict(profile.to_dict()) for profile in profiles)
+            profile_snapshot = tuple(ServerProfile.from_dict(profile.to_dict()) for profile in profiles)
             summary = self._scan_profiles(profile_snapshot, settings, on_batch)
         except Exception as exc:
             on_error(exc)
@@ -223,12 +255,12 @@ class LatencyScanner:
 
     def _scan_profiles(
         self,
-        profiles: tuple[VlessProfile, ...],
+        profiles: tuple[ServerProfile, ...],
         settings: AppSettings,
         on_batch: LatencyBatchCallback,
     ) -> LatencyScanSummary:
         total_profiles = len(profiles)
-        prepared: list[tuple[str, VlessProfile, str]] = []
+        prepared: list[tuple[str, ServerProfile, str]] = []
         invalid_ids: list[str] = []
         outbounds: list[dict] = []
 
@@ -310,10 +342,12 @@ class LatencyScanner:
                 self._check_latency_config(exe, config_path)
             self._start_latency_core(exe, config_path)
             self._wait_clash_api_ready(controller_port)
+            test_urls = normalize_connectivity_urls(settings.connectivity_check_urls)
+            test_timeout_ms = normalize_connectivity_timeout_ms(settings.connectivity_check_timeout_ms)
 
             executor = ThreadPoolExecutor(max_workers=min(self.max_workers, len(prepared)))
             futures = {
-                executor.submit(self._measure_outbound_delay, controller_port, tag): profile_id
+                executor.submit(self._measure_outbound_delay, controller_port, tag, test_urls, test_timeout_ms): profile_id
                 for profile_id, _profile, tag in prepared
             }
             try:
@@ -452,15 +486,18 @@ class LatencyScanner:
         return f"latency-{profile_id}"
 
     @staticmethod
-    def _validate_profile(profile: VlessProfile) -> None:
+    def _validate_profile(profile: ServerProfile) -> None:
         if not (profile.address or "").strip():
             raise ValueError("empty address")
         port = int(profile.port)
         if port <= 0 or port > 65535:
             raise ValueError("invalid port")
-        if not (profile.uuid or "").strip():
-            raise ValueError("empty uuid")
-        uuid.UUID(str(profile.uuid).strip())
+        if not (profile.protocol or "").strip():
+            raise ValueError("empty protocol")
+        if str(profile.protocol or "").lower() in {"vless", "vmess", "tuic"}:
+            if not (profile.uuid or "").strip():
+                raise ValueError("empty uuid")
+            uuid.UUID(str(profile.uuid).strip())
 
     def _ensure_binary(self) -> Path:
         if self.binary_provider:
@@ -559,12 +596,12 @@ class LatencyScanner:
     def _filter_checkable_outbounds(
         self,
         exe: Path,
-        prepared: list[tuple[str, VlessProfile, str]],
+        prepared: list[tuple[str, ServerProfile, str]],
         outbounds: list[dict],
         settings: AppSettings,
         controller_port: int,
-    ) -> tuple[list[tuple[str, VlessProfile, str]], list[dict], list[str]]:
-        valid_prepared: list[tuple[str, VlessProfile, str]] = []
+    ) -> tuple[list[tuple[str, ServerProfile, str]], list[dict], list[str]]:
+        valid_prepared: list[tuple[str, ServerProfile, str]] = []
         valid_outbounds: list[dict] = []
         broken_ids: list[str] = []
         for prepared_item, outbound in zip(prepared, outbounds, strict=False):
@@ -631,18 +668,26 @@ class LatencyScanner:
                 time.sleep(0.1)
         raise RuntimeError("latency core не запустил Clash API вовремя")
 
-    def _measure_outbound_delay(self, controller_port: int, tag: str) -> int | None:
+    def _measure_outbound_delay(
+        self,
+        controller_port: int,
+        tag: str,
+        test_urls: list[str],
+        timeout_ms: int,
+    ) -> int | None:
         """Повторяет Karing URL-test и использует тот же список URL как быстрый fallback."""
+        urls = test_urls or list(KARING_URL_TEST_LIST)
+        primary_url = urls[0]
         for _attempt in range(KARING_LATENCY_RETRY_COUNT):
             if self._cancel_event.is_set():
                 return None
-            latency = self._measure_outbound_delay_once(controller_port, tag, KARING_URL_TEST_LIST[0], self.timeout_ms)
+            latency = self._measure_outbound_delay_once(controller_port, tag, primary_url, timeout_ms)
             if latency is not None:
                 return latency
 
-        fallback_timeout_ms = min(self.timeout_ms, KARING_LATENCY_FALLBACK_TIMEOUT_MS)
+        fallback_timeout_ms = min(timeout_ms, KARING_LATENCY_FALLBACK_TIMEOUT_MS)
         best_latency: int | None = None
-        for test_url in KARING_URL_TEST_LIST[1:]:
+        for test_url in urls[1:]:
             if self._cancel_event.is_set():
                 return best_latency
             latency = self._measure_outbound_delay_once(controller_port, tag, test_url, fallback_timeout_ms)
