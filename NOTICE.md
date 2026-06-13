@@ -1,6 +1,6 @@
 # NOTICE
 
-Razreshenie VPN Client version 2.0.0.
+Razreshenie VPN Client version 2.0.1.
 
 Razreshenie VPN Client is distributed under GPLv3.
 

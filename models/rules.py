@@ -22,6 +22,7 @@ import os
 import re
 import uuid
 from dataclasses import asdict, dataclass, field
+from ipaddress import ip_address
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import urlparse
@@ -43,10 +44,24 @@ BUILTIN_DIRECT_RULE_ID = "builtin-direct-russian-sites"
 BUILTIN_DIRECT_RULE_NAME = "Встроенный bypass: whitelist"
 BUILTIN_DIRECT_SOURCE = "assets/rules/builtin_bypass_whitelist.json"
 BUILTIN_DIRECT_FALLBACK_DOMAIN_SUFFIXES = (
+    "ozon.by",
+    "ozon.kz",
+    "ozon.ru",
+    "ozone.ru",
+    "ozonusercontent.com",
+    "ozon-st.cdn.ngenix.net",
+    "ozon-st.cdnvideo.ru",
+    "wildberries.am",
+    "wildberries.by",
+    "wildberries.kz",
     "wildberries.ru",
+    "wildberries.uz",
     "wb.ru",
+    "wbdl.ru",
     "wbbasket.ru",
+    "wbstatic.ru",
     "wbstatic.net",
+    "wbxcdn.com",
 )
 BUILTIN_DOMAIN_KEYS = {
     "domain",
@@ -55,6 +70,26 @@ BUILTIN_DOMAIN_KEYS = {
     "domain_suffixes",
     "host",
     "hosts",
+}
+COMMON_SECOND_LEVEL_SUFFIXES = {
+    "ac.uk",
+    "co.il",
+    "co.jp",
+    "co.kr",
+    "co.uk",
+    "com.au",
+    "com.br",
+    "com.cn",
+    "com.ru",
+    "com.tr",
+    "com.ua",
+    "net.au",
+    "net.ru",
+    "net.ua",
+    "ne.jp",
+    "org.uk",
+    "org.ru",
+    "org.ua",
 }
 
 
@@ -114,6 +149,84 @@ def _clean_quoted_text(value: Any) -> str:
     while len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"', "`"}:
         text = text[1:-1].strip()
     return text.strip("'\"`").strip()
+
+
+def normalize_domain_match(value: Any, *, keep_prefix: bool = False) -> str:
+    """Normalize user-entered domain patterns without changing their meaning."""
+    text = _clean_quoted_text(value).lower()
+    if not text:
+        return ""
+
+    prefix = ""
+    if ":" in text:
+        raw_prefix, _, tail = text.partition(":")
+        normalized_prefix = raw_prefix.strip().lower().replace("-", "_")
+        if normalized_prefix in {"domain", "full", "keyword"}:
+            prefix = normalized_prefix
+            text = tail.strip()
+
+    if prefix == "keyword":
+        keyword = text.strip().strip(".")
+        return f"{prefix}:{keyword}" if keep_prefix and keyword else keyword
+
+    if "://" in text:
+        parsed = urlparse(text)
+        text = parsed.hostname or ""
+
+    text = re.split(r"[/?#]", text, maxsplit=1)[0].strip()
+    if text.startswith("[") and "]" in text:
+        text = text[1 : text.index("]")]
+    elif text.count(":") == 1:
+        host, separator, port = text.rpartition(":")
+        if separator and host and port.isdigit():
+            text = host
+    text = text.removeprefix("*.").removeprefix(".").strip(".")
+    if not text:
+        return ""
+    return f"{prefix}:{text}" if keep_prefix and prefix else text
+
+
+def domain_site_suffix(value: Any) -> str:
+    """Return the registrable site zone used for one-click bypass rules."""
+    domain = normalize_domain_match(value)
+    if not domain or "." not in domain:
+        return domain
+    parts = [part for part in domain.split(".") if part]
+    if len(parts) <= 2:
+        return domain
+    last_two = ".".join(parts[-2:])
+    if last_two in COMMON_SECOND_LEVEL_SUFFIXES and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return last_two
+
+
+def clean_domain_matches(values: Any) -> list[str]:
+    return _unique_sorted_casefold(
+        [domain for domain in (normalize_domain_match(item) for item in _clean_string_list(values)) if domain]
+    )
+
+
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def effective_rule_domains(rule_set: Any) -> list[str]:
+    return clean_domain_matches(getattr(rule_set, "domains", []))
+
+
+def effective_rule_domain_suffixes(rule_set: Any, *, expand_direct_domains: bool = True) -> list[str]:
+    suffixes = clean_domain_matches(getattr(rule_set, "domain_suffix", []))
+    if expand_direct_domains and normalize_outbound(getattr(rule_set, "outbound", None)) == ROUTE_OUTBOUND_DIRECT:
+        suffixes.extend(
+            suffix
+            for suffix in (domain_site_suffix(domain) for domain in getattr(rule_set, "domains", []))
+            if suffix and "." in suffix and not _is_ip_literal(suffix)
+        )
+    return _unique_sorted_casefold(suffixes)
 
 
 def _trim_windows_executable_arguments(value: str) -> str:
@@ -211,17 +324,12 @@ def _source_tag(value: str | None) -> str:
 
 
 def _clean_builtin_domain(value: str) -> str:
-    text = value.strip().lower()
+    text = _clean_quoted_text(value).lower()
     text = text.removeprefix("regexp:")
     text = text.removeprefix("geosite:")
     text = text.removeprefix("domain:")
     text = text.removeprefix("full:")
-    if "://" in text:
-        parsed = urlparse(text)
-        text = parsed.hostname or ""
-    text = text.split("/")[0].strip()
-    text = text.removeprefix("*.").removeprefix(".")
-    return text
+    return normalize_domain_match(text)
 
 
 def _walk_builtin_domains(value: Any, key: str | None, domains: set[str]) -> None:

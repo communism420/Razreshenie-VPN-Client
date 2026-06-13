@@ -36,6 +36,8 @@ from models.rules import (
     clean_process_names,
     clean_process_path_regexes,
     clean_process_paths,
+    effective_rule_domain_suffixes,
+    effective_rule_domains,
     normalize_outbound,
     normalize_rule_set_resource_format,
     normalize_rule_set_resource_type,
@@ -167,17 +169,28 @@ class SingBoxConfigBuilder:
         enable_ipv6: bool = True,
     ) -> dict[str, Any]:
         outbound = normalize_outbound(rule_set.outbound)
-        if use_fakeip and outbound == ROUTE_OUTBOUND_PROXY:
+        domains = effective_rule_domains(rule_set)
+        domain_suffix = effective_rule_domain_suffixes(rule_set)
+        has_domain_selector = any(
+            (
+                domains,
+                domain_suffix,
+                rule_set.domain_keyword,
+                rule_set.domain_regex,
+                rule_set.geosite,
+            )
+        )
+        if use_fakeip and has_domain_selector:
             server = "fakeip"
         else:
             server = "proxy-dns" if outbound == ROUTE_OUTBOUND_PROXY else "bootstrap-dns"
         selector: dict[str, Any] = {"action": "route", "server": server}
         if server == "fakeip":
             selector["query_type"] = ["A", "AAAA"] if enable_ipv6 else ["A"]
-        if rule_set.domains:
-            selector["domain"] = sorted(set(rule_set.domains))
-        if rule_set.domain_suffix:
-            selector["domain_suffix"] = sorted(set(rule_set.domain_suffix))
+        if domains:
+            selector["domain"] = domains
+        if domain_suffix:
+            selector["domain_suffix"] = domain_suffix
         if rule_set.domain_keyword:
             selector["domain_keyword"] = sorted(set(rule_set.domain_keyword))
         if rule_set.domain_regex:
@@ -377,10 +390,12 @@ class SingBoxConfigBuilder:
             raise ConfigBuildError(f"Неизвестный маршрут ruleset '{rule_set.name}'")
 
         selector: dict[str, Any] = {"action": "route", "outbound": outbound}
-        if rule_set.domains:
-            selector["domain"] = sorted(set(rule_set.domains))
-        if rule_set.domain_suffix:
-            selector["domain_suffix"] = sorted(set(rule_set.domain_suffix))
+        domains = effective_rule_domains(rule_set)
+        domain_suffix = effective_rule_domain_suffixes(rule_set)
+        if domains:
+            selector["domain"] = domains
+        if domain_suffix:
+            selector["domain_suffix"] = domain_suffix
         if rule_set.domain_keyword:
             selector["domain_keyword"] = sorted(set(rule_set.domain_keyword))
         if rule_set.domain_regex:

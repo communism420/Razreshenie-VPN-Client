@@ -28,6 +28,8 @@ from models.rules import (
     RoutingRuleSet,
     SplitRules,
     builtin_direct_rule_sets,
+    effective_rule_domain_suffixes,
+    effective_rule_domains,
     normalize_outbound,
 )
 
@@ -272,10 +274,10 @@ class DomainActivityTracker:
 
     def _matches_rule_set(self, domain: str, rule_set: RoutingRuleSet) -> bool:
         clean_domain = domain.strip().lower().strip(".")
-        exact_domains = {item.strip().lower().strip(".") for item in rule_set.domains}
+        exact_domains = {item.strip().lower().strip(".") for item in effective_rule_domains(rule_set)}
         if clean_domain in exact_domains:
             return True
-        for suffix in rule_set.domain_suffix:
+        for suffix in effective_rule_domain_suffixes(rule_set):
             clean = suffix.strip().lower().removeprefix("*.").removeprefix(".")
             if clean_domain == clean or clean_domain.endswith(f".{clean}"):
                 return True

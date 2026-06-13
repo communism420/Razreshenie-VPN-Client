@@ -81,7 +81,7 @@ def run_self_check() -> int:
         SmartGroup,
     )
     from models.profile import Subscription, VlessProfile
-    from models.rules import RouteRuleSetResource, RoutingRuleSet, SplitRules
+    from models.rules import RouteRuleSetResource, RoutingRuleSet, SplitRules, domain_site_suffix
     from models.settings import (
         BACKGROUND_HEALTH_CHECK_MAX_FAILURE_THRESHOLD,
         BACKGROUND_HEALTH_CHECK_MAX_INTERVAL_SECONDS,
@@ -602,6 +602,7 @@ def run_self_check() -> int:
                 'process:C:\\\\Tools\\\\Legacy.exe --profile test',
                 '"C:/Program Files/App/app.exe" --flag',
                 "process-path-regex:(?i).*\\\\Telegram\\\\.*\\.exe$",
+                "domain:*.video.example.com",
             ]
         ),
         "direct",
@@ -615,6 +616,7 @@ def run_self_check() -> int:
     ]
     assert imported_inline_rules.process_path == ["C:\\Program Files\\App\\app.exe"]
     assert imported_inline_rules.process_name == ["Legacy.exe", "telegram.exe"]
+    assert "video.example.com" in imported_inline_rules.domain_suffix
 
     process_config = builder.build(
         profile,
@@ -637,6 +639,75 @@ def run_self_check() -> int:
     assert process_route["process_name"] == ["Telegram.exe"]
     assert process_route["process_path"] == ["C:\\Program Files\\App\\app.exe"]
     assert process_route["process_path_regex"] == ["(?i).*\\\\chrome\\.exe$"]
+    assert domain_site_suffix("www.example.co.uk") == "example.co.uk"
+
+    direct_zone_config = builder.build(
+        profile,
+        AppSettings(mode="tun"),
+        SplitRules(
+            enabled=True,
+            rule_sets=[
+                RoutingRuleSet(
+                    name="Direct player exact domain",
+                    outbound="direct",
+                    domains=["www.familyguy.example"],
+                )
+            ],
+        ),
+        log_path=None,
+    )
+    direct_dns_rule = next(
+        rule
+        for rule in direct_zone_config["dns"]["rules"]
+        if rule.get("domain") == ["www.familyguy.example"]
+    )
+    assert direct_dns_rule["server"] == "fakeip"
+    assert direct_dns_rule["query_type"] == ["A", "AAAA"]
+    assert "familyguy.example" in direct_dns_rule["domain_suffix"]
+    direct_route_rule = next(
+        rule
+        for rule in direct_zone_config["route"]["rules"]
+        if rule.get("domain") == ["www.familyguy.example"]
+    )
+    assert direct_route_rule["outbound"] == "direct"
+    assert "familyguy.example" in direct_route_rule["domain_suffix"]
+    direct_zone_proxy_config = builder.build(
+        profile,
+        AppSettings(mode="proxy"),
+        SplitRules(
+            enabled=True,
+            rule_sets=[
+                RoutingRuleSet(
+                    name="Direct player proxy-mode",
+                    outbound="direct",
+                    domains=["www.familyguy.example"],
+                )
+            ],
+        ),
+        log_path=None,
+    )
+    direct_proxy_dns_rule = next(
+        rule
+        for rule in direct_zone_proxy_config["dns"]["rules"]
+        if rule.get("domain") == ["www.familyguy.example"]
+    )
+    assert direct_proxy_dns_rule["server"] == "bootstrap-dns"
+
+    builtin_direct_config = builder.build(profile, AppSettings(mode="tun"), SplitRules(), log_path=None)
+    builtin_direct_dns = next(
+        rule
+        for rule in builtin_direct_config["dns"]["rules"]
+        if "ozon.ru" in rule.get("domain_suffix", [])
+    )
+    assert builtin_direct_dns["server"] == "fakeip"
+    builtin_direct_route = next(
+        rule
+        for rule in builtin_direct_config["route"]["rules"]
+        if rule.get("outbound") == "direct" and "ozon.ru" in rule.get("domain_suffix", [])
+    )
+    assert "wildberries.ru" in builtin_direct_route["domain_suffix"]
+    assert "ozone.ru" in builtin_direct_route["domain_suffix"]
+    assert "ozonusercontent.com" in builtin_direct_route["domain_suffix"]
 
     activity_tracker = DomainActivityTracker()
     activity_rules = SplitRules(
@@ -670,6 +741,21 @@ def run_self_check() -> int:
         "openai.com"
     ]
     assert [entry.domain for entry in activity_tracker.snapshot(query="direct")] == ["yandex.ru"]
+    activity_zone_tracker = DomainActivityTracker()
+    activity_zone_rules = SplitRules(
+        enabled=True,
+        rule_sets=[
+            RoutingRuleSet(
+                name="Direct player exact",
+                outbound="direct",
+                domains=["www.familyguy.example"],
+            )
+        ],
+    )
+    assert activity_zone_tracker.ingest_log_line("[sing-box] resolved cdn.familyguy.example", activity_zone_rules)
+    activity_zone_entry = activity_zone_tracker.snapshot()[0]
+    assert activity_zone_entry.route == "direct"
+    assert activity_zone_entry.rule_name == "Direct player exact"
 
     json_rules = rules_manager.from_json(
         {

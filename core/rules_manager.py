@@ -34,6 +34,7 @@ from models.rules import (
     clean_process_names,
     clean_process_path_regexes,
     clean_process_paths,
+    normalize_domain_match,
     normalize_outbound,
     normalize_process_name,
     normalize_process_path,
@@ -339,18 +340,12 @@ class RulesManager:
             return
 
     def _clean_domain(self, value: str) -> str:
-        text = value.strip().lower()
-        if "://" in text:
-            parsed = urlparse(text)
-            text = parsed.hostname or ""
-        text = text.split("/")[0].strip()
-        text = text.removeprefix("*.").removeprefix(".")
-        return text
+        return normalize_domain_match(value, keep_prefix=True)
 
     def _looks_like_domain(self, value: str) -> bool:
         if self._has_known_prefix(value):
             return False
-        text = self._clean_domain(value)
+        text = normalize_domain_match(value)
         return bool(re.match(r"^[a-z0-9_-]+(\.[a-z0-9_-]+)+$", text))
 
     def _looks_like_cidr(self, value: str) -> bool:

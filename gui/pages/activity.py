@@ -106,7 +106,7 @@ class DomainActivityTableModel(QAbstractTableModel):
             if column == ACTIVITY_ACTION_PROXY_COLUMN:
                 return f"Добавить домен {entry.domain} в правила через VPN"
             if column == ACTIVITY_ACTION_DIRECT_COLUMN:
-                return f"Добавить домен {entry.domain} в правила напрямую"
+                return f"Добавить зону сайта для {entry.domain} в правила напрямую"
             return f"{entry.domain}\n{entry.rule_name}\n{entry.hits} событий"
         if role == Qt.ItemDataRole.ForegroundRole:
             route = self._routes[row]
@@ -262,8 +262,8 @@ class DomainActivityPage(QWidget):
         self.sort_combo.addItem("Правило", userData=DOMAIN_ACTIVITY_SORT_RULE)
         self.sort_combo.addItem("Первый раз", userData=DOMAIN_ACTIVITY_SORT_FIRST_SEEN)
         self.rule_match_combo = ComboBox(self)
-        self.rule_match_combo.addItem("Домен", userData="domain")
         self.rule_match_combo.addItem("Зона", userData="domain_suffix")
+        self.rule_match_combo.addItem("Домен", userData="domain")
         self.rule_outbound_combo = ComboBox(self)
         self.rule_outbound_combo.addItem("Напрямую", userData=ROUTE_OUTBOUND_DIRECT)
         self.rule_outbound_combo.addItem("Через VPN", userData=ROUTE_OUTBOUND_PROXY)
@@ -395,7 +395,8 @@ class DomainActivityPage(QWidget):
         if not entry:
             return
         outbound = ROUTE_OUTBOUND_PROXY if index.column() == ACTIVITY_ACTION_PROXY_COLUMN else ROUTE_OUTBOUND_DIRECT
-        self._emit_route_rule(entry.domain, "domain", outbound)
+        match_kind = "domain_suffix" if outbound == ROUTE_OUTBOUND_DIRECT else "domain"
+        self._emit_route_rule(entry.domain, match_kind, outbound)
 
     def _handle_table_double_click(self, index: QModelIndex) -> None:
         if index.isValid() and index.column() in {ACTIVITY_ACTION_PROXY_COLUMN, ACTIVITY_ACTION_DIRECT_COLUMN}:

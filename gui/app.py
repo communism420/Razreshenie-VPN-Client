@@ -133,6 +133,7 @@ from models.rules import (
     RouteRuleSetResource,
     RoutingRuleSet,
     SplitRules,
+    domain_site_suffix,
     normalize_outbound,
 )
 from models.settings import (
@@ -192,22 +193,6 @@ LIVE_ACTIVITY_RULE_SOURCE_TYPE = "live_activity"
 LIVE_ACTIVITY_RULE_SOURCE = "Live Activity"
 PER_APP_RULE_SOURCE_TYPE = "per_app"
 PER_APP_RULE_SOURCE = "Per-app routing"
-COMMON_SECOND_LEVEL_SUFFIXES = {
-    "ac.uk",
-    "co.jp",
-    "co.uk",
-    "com.au",
-    "com.br",
-    "com.cn",
-    "com.ru",
-    "com.tr",
-    "net.au",
-    "net.ru",
-    "org.uk",
-    "org.ru",
-}
-
-
 class UiBridge(QObject):
     call = pyqtSignal(object)
     log_line = pyqtSignal(str, str)
@@ -3593,13 +3578,7 @@ class RazreshenieWindow(FluentWindow):
 
     @staticmethod
     def _activity_domain_suffix(domain: str) -> str:
-        parts = [part for part in domain.split(".") if part]
-        if len(parts) <= 2:
-            return domain
-        last_two = ".".join(parts[-2:])
-        if last_two in COMMON_SECOND_LEVEL_SUFFIXES and len(parts) >= 3:
-            return ".".join(parts[-3:])
-        return last_two
+        return domain_site_suffix(domain)
 
     def save_settings(self, *, restart_connected: bool = True, show_success: bool = True) -> None:
         before_runtime = self._settings_runtime_key(self.settings)
