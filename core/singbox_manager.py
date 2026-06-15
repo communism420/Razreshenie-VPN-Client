@@ -43,6 +43,7 @@ from core.connectivity import (
     normalize_connectivity_urls,
 )
 from core.config_builder import ConfigBuildError, SingBoxConfigBuilder
+from models.connection import SMART_GROUP_MODE_MULTI_HOP, SmartGroup, normalize_smart_group_mode
 from models.profile import ServerProfile
 from models.rules import SplitRules
 from models.settings import AppSettings
@@ -66,6 +67,10 @@ class _ConnectionPlan:
     fingerprint: str
     outbound_count: int
     clash_api_port: int
+    display_name: str
+    profile_ids: tuple[str, ...]
+    target_type: str
+    group_id: str | None = None
 
 
 class SingBoxManager:
@@ -235,6 +240,18 @@ class SingBoxManager:
         except ConfigBuildError as exc:
             raise SingBoxError(str(exc)) from exc
 
+    def _build_group_config(
+        self,
+        group: SmartGroup,
+        profiles_by_id: dict[str, ServerProfile],
+        settings: AppSettings,
+        split_rules: SplitRules,
+    ) -> dict[str, Any]:
+        try:
+            return self.builder.build_group(group, profiles_by_id, settings, split_rules, paths.log_file_path())
+        except ConfigBuildError as exc:
+            raise SingBoxError(str(exc)) from exc
+
     def check_config(self, config_path: Path | None = None) -> tuple[bool, str]:
         exe = self.ensure_binary()
         target = config_path or self.config_path
@@ -268,6 +285,39 @@ class SingBoxManager:
             stopped_for_reload = False
             try:
                 plan = self._prepare_connection_plan(profile, settings, split_rules, fingerprint)
+                if running:
+                    self._stop_process_locked(wait_tun_release=True, mark_disconnected=False)
+                    stopped_for_reload = True
+                self._start_prepared_plan(plan, reload=running)
+            except Exception:
+                if stopped_for_reload or not running:
+                    self._mark_disconnected()
+                elif self.process and self.process.poll() is None:
+                    self._connection_state = "connected"
+                else:
+                    self._mark_disconnected()
+                raise
+
+    def start_group(
+        self,
+        group: SmartGroup,
+        profiles_by_id: dict[str, ServerProfile],
+        settings: AppSettings,
+        split_rules: SplitRules,
+    ) -> None:
+        with self._lock:
+            fingerprint = self._group_connection_fingerprint(group, profiles_by_id, settings, split_rules)
+            running = self.is_running()
+            if running:
+                if self._active_fingerprint == fingerprint and self._connection_state == "connected":
+                    self.logger.info("Подключение уже активно: %s", group.name)
+                    return
+                self.logger.info("Конфигурация group-подключения изменилась, выполняется Karing-style reload")
+
+            self._connection_state = "reloading" if running else "connecting"
+            stopped_for_reload = False
+            try:
+                plan = self._prepare_group_connection_plan(group, profiles_by_id, settings, split_rules, fingerprint)
                 if running:
                     self._stop_process_locked(wait_tun_release=True, mark_disconnected=False)
                     stopped_for_reload = True
@@ -319,6 +369,58 @@ class SingBoxManager:
             fingerprint=fingerprint,
             outbound_count=outbound_count,
             clash_api_port=clash_api_port,
+            display_name=profile.name,
+            profile_ids=(profile.id,),
+            target_type="profile",
+            group_id=None,
+        )
+
+    def _prepare_group_connection_plan(
+        self,
+        group: SmartGroup,
+        profiles_by_id: dict[str, ServerProfile],
+        settings: AppSettings,
+        split_rules: SplitRules,
+        fingerprint: str,
+    ) -> _ConnectionPlan:
+        exe = self.ensure_binary()
+        members = self._group_member_profiles(group, profiles_by_id)
+        for member in members:
+            self._preflight_profile(member)
+        config = self._build_group_config(group, profiles_by_id, settings, split_rules)
+        clash_api_port = self._reserve_local_port()
+        config.setdefault("experimental", {})["clash_api"] = {
+            "external_controller": f"127.0.0.1:{clash_api_port}",
+            "secret": "",
+        }
+        write_json(self.config_path, config)
+        ok, output = self.check_config(self.config_path)
+        if not ok:
+            raise SingBoxError(f"sing-box отклонил group-конфигурацию:\n{output}")
+        if settings.mode == "tun":
+            conflicts = self._active_foreign_tun_adapters(settings.tun_interface_name, timeout=1.2)
+            if conflicts:
+                names = ", ".join(conflicts[:3])
+                raise SingBoxError(
+                    "Обнаружен активный TUN другого VPN: "
+                    f"{names}. Закройте Karing или другой VPN-клиент и подключитесь заново, "
+                    "иначе Windows будет использовать чужой DNS, а раздельное туннелирование не сработает."
+                )
+        outbound_count = len(config.get("outbounds") or [])
+        display_name = self._group_display_name(group)
+        self.logger.info("Karing-style setServer: group config готов, outbounds=%s", outbound_count)
+        return _ConnectionPlan(
+            profile=self._group_exit_profile(group, members),
+            settings=settings,
+            executable=exe,
+            config_path=self.config_path,
+            fingerprint=fingerprint,
+            outbound_count=outbound_count,
+            clash_api_port=clash_api_port,
+            display_name=display_name,
+            profile_ids=tuple(member.id for member in members),
+            target_type=normalize_smart_group_mode(group.mode),
+            group_id=group.id,
         )
 
     def _start_prepared_plan(self, plan: _ConnectionPlan, *, reload: bool) -> None:
@@ -364,7 +466,7 @@ class SingBoxManager:
             if settings.mode != "tun":
                 if self._wait_until_proxy_ready(settings.mixed_listen_host, int(settings.mixed_port), max_wait=3.0):
                     self._wait_until_clash_api_ready(plan.clash_api_port, max_wait=1.0)
-                    self._mark_connected(plan.profile, plan.fingerprint, plan.clash_api_port)
+                    self._mark_connected(plan.profile, plan.fingerprint, plan.clash_api_port, plan.display_name)
                     self._start_background_health_check(plan)
                     return
                 exited = self.process is None or self.process.poll() is not None
@@ -392,7 +494,7 @@ class SingBoxManager:
                 self.logger.warning(
                     "sing-box запустился, но Clash API не ответил сразу; продолжаю запуск как Karing-style service start"
                 )
-            self._mark_connected(plan.profile, plan.fingerprint, plan.clash_api_port)
+            self._mark_connected(plan.profile, plan.fingerprint, plan.clash_api_port, plan.display_name)
             self._start_background_health_check(plan)
             self._start_post_connect_tasks(settings)
             return
@@ -453,13 +555,19 @@ class SingBoxManager:
         with self._output_lock:
             return list(self._last_output_lines)
 
-    def _mark_connected(self, profile: ServerProfile, fingerprint: str, clash_api_port: int | None) -> None:
+    def _mark_connected(
+        self,
+        profile: ServerProfile,
+        fingerprint: str,
+        clash_api_port: int | None,
+        display_name: str | None = None,
+    ) -> None:
         self._active_fingerprint = fingerprint
-        self._active_profile_name = profile.name
+        self._active_profile_name = display_name or profile.name
         self._active_clash_api_port = clash_api_port
         self._connection_state = "connected"
         self._connected_at = time.monotonic()
-        self.logger.info("Подключение активно: %s", profile.name)
+        self.logger.info("Подключение активно: %s", self._active_profile_name)
 
     def _mark_disconnected(self) -> None:
         self._active_tun_interface = None
@@ -533,6 +641,72 @@ class SingBoxManager:
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _group_connection_fingerprint(
+        self,
+        group: SmartGroup,
+        profiles_by_id: dict[str, ServerProfile],
+        settings: AppSettings,
+        split_rules: SplitRules,
+    ) -> str:
+        members = self._group_member_profiles(group, profiles_by_id)
+        payload = {
+            "group": {
+                "id": group.id,
+                "name": group.name,
+                "mode": normalize_smart_group_mode(group.mode),
+                "strategy": group.strategy,
+                "profile_ids": [profile.id for profile in members],
+                "load_balance_interval": group.load_balance_interval,
+                "load_balance_tolerance_ms": int(group.load_balance_tolerance_ms),
+            },
+            "profiles": [
+                {
+                    "id": profile.id,
+                    "protocol": profile.protocol,
+                    "address": profile.address,
+                    "port": int(profile.port),
+                    "uuid": profile.uuid,
+                    "raw_url": profile.raw_url,
+                    "params": dict(sorted(profile.params.items())),
+                }
+                for profile in members
+            ],
+            "settings": {
+                "mode": settings.mode,
+                "mixed_listen_host": settings.mixed_listen_host,
+                "mixed_port": int(settings.mixed_port),
+                "tun_interface_name": settings.tun_interface_name,
+                "tun_address": settings.tun_address,
+                "tun_mtu": int(settings.tun_mtu),
+                "dns_servers": list(settings.dns_servers),
+                "kill_switch": bool(settings.kill_switch),
+                "log_level": settings.log_level,
+            },
+            "split_rules": split_rules.to_dict(),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _group_member_profiles(group: SmartGroup, profiles_by_id: dict[str, ServerProfile]) -> list[ServerProfile]:
+        members = [profiles_by_id[profile_id] for profile_id in group.profile_ids if profile_id in profiles_by_id]
+        if not members:
+            raise SingBoxError(f"Группа '{group.name}' не содержит доступных серверов")
+        return members
+
+    @staticmethod
+    def _group_exit_profile(group: SmartGroup, members: list[ServerProfile]) -> ServerProfile:
+        return members[-1] if normalize_smart_group_mode(group.mode) == SMART_GROUP_MODE_MULTI_HOP else members[0]
+
+    @staticmethod
+    def _group_display_name(group: SmartGroup) -> str:
+        mode = normalize_smart_group_mode(group.mode)
+        if mode == SMART_GROUP_MODE_MULTI_HOP:
+            suffix = "Multi-hop"
+        else:
+            suffix = "Load Balance"
+        return f"{group.name} · {suffix}"
 
     def _wait_until_proxy_ready(self, host: str, port: int, max_wait: float = 8.0) -> bool:
         connect_host = self._connect_host(host)

@@ -90,6 +90,8 @@ class SmartConnectManager:
         if active_profile is None:
             return self._limit_by_score(profile_list, limit)
 
+        # Кандидаты намеренно сужаются вокруг выбранного сервера: explicit
+        # группа, группа провайдера, подписка, и только затем общий список.
         explicit_group = self._explicit_group_for_profile(active_profile)
         if explicit_group:
             by_id = {profile.id: profile for profile in profile_list}
@@ -185,6 +187,8 @@ class SmartConnectManager:
         if not profile_list:
             return []
 
+        # Для explicit failover-группы порядок пользователя важнее глобального
+        # score; smart/latency стратегии включаются только после фильтрации.
         strategy = SMART_STRATEGY_SMART
         if active_profile is None:
             ordered = self._limit_by_score(profile_list, limit)
@@ -290,6 +294,8 @@ class SmartConnectManager:
         latency = self._effective_latency(profile, stats, latency_override_ms, latency_override_present)
         score = float(latency)
         if stats:
+            # Score держит баланс между свежей latency и долговременной
+            # стабильностью, чтобы быстрый, но падающий сервер не побеждал.
             score += stats.consecutive_failures * SMART_CONNECT_CONSECUTIVE_FAILURE_PENALTY_MS
             score += stats.failure_count * SMART_CONNECT_FAILURE_PENALTY_MS
             score -= min(SMART_CONNECT_STABILITY_BONUS_MS, stats.success_count * 12.0)
@@ -358,6 +364,26 @@ class SmartConnectManager:
         stats.last_checked_at = timestamp
         stats.cooldown_until = None
         stats.add_event(QUALITY_EVENT_SUCCESS, timestamp=timestamp, success=True)
+        return stats
+
+    def record_usage(
+        self,
+        profile_id: str,
+        *,
+        connected_seconds: int,
+        download_bytes: int,
+        upload_bytes: int,
+        connected_at: str | None = None,
+        disconnected_at: str | None = None,
+    ) -> ServerQualityStats:
+        stats = self._stats_for(profile_id)
+        stats.record_usage(
+            connected_seconds=connected_seconds,
+            download_bytes=download_bytes,
+            upload_bytes=upload_bytes,
+            connected_at=connected_at,
+            disconnected_at=disconnected_at,
+        )
         return stats
 
     def prune_missing_profiles(self, profile_ids: Iterable[str]) -> None:

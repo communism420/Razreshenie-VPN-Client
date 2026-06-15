@@ -75,6 +75,8 @@ def run_self_check() -> int:
         QUALITY_EVENT_LATENCY,
         QUALITY_EVENT_SUCCESS,
         SERVER_QUALITY_HISTORY_LIMIT,
+        SMART_GROUP_MODE_LOAD_BALANCE,
+        SMART_GROUP_MODE_MULTI_HOP,
         SMART_STRATEGY_FAILOVER_ORDER,
         ServerQualityEvent,
         ServerQualityStats,
@@ -186,6 +188,44 @@ def run_self_check() -> int:
     assert ipv4_only_config["dns"]["rules"][-1]["query_type"] == ["A"]
     strict_route_config = builder.build(profile, AppSettings(mode="tun", kill_switch=True), rules, log_path=None)
     assert strict_route_config["inbounds"][0]["strict_route"] is True
+
+    multi_hop_profiles = {
+        "hop-a": VlessProfile(
+            id="hop-a",
+            name="Hop A",
+            protocol="vless",
+            address="hop-a.example.com",
+            port=443,
+            uuid="00000000-0000-4000-8000-000000000001",
+        ),
+        "hop-b": VlessProfile(
+            id="hop-b",
+            name="Hop B",
+            protocol="vless",
+            address="hop-b.example.com",
+            port=443,
+            uuid="00000000-0000-4000-8000-000000000002",
+        ),
+    }
+    multi_hop_config = builder.build_group(
+        SmartGroup(name="Chain", mode=SMART_GROUP_MODE_MULTI_HOP, profile_ids=["hop-a", "hop-b"]),
+        multi_hop_profiles,
+        settings,
+        rules,
+        log_path=None,
+    )
+    assert [item["tag"] for item in multi_hop_config["outbounds"][:2]] == ["hop-1", "proxy"]
+    assert multi_hop_config["outbounds"][1]["detour"] == "hop-1"
+    load_balance_config = builder.build_group(
+        SmartGroup(name="LB", mode=SMART_GROUP_MODE_LOAD_BALANCE, profile_ids=["hop-a", "hop-b"]),
+        multi_hop_profiles,
+        settings,
+        rules,
+        log_path=None,
+    )
+    lb_proxy = next(item for item in load_balance_config["outbounds"] if item.get("tag") == "proxy")
+    assert lb_proxy["type"] == "urltest"
+    assert lb_proxy["outbounds"] == ["lb-1", "lb-2"]
     firewall_settings = AppSettings.from_dict({"firewall_kill_switch": "true"})
     assert firewall_settings.firewall_kill_switch is True
     update_settings = AppSettings.from_dict({"auto_check_app_updates": "yes"})

@@ -32,6 +32,16 @@ SMART_GROUP_STRATEGIES = {
     SMART_STRATEGY_LATENCY,
     SMART_STRATEGY_FAILOVER_ORDER,
 }
+SMART_GROUP_MODE_FAILOVER = "failover"
+SMART_GROUP_MODE_MULTI_HOP = "multi_hop"
+SMART_GROUP_MODE_LOAD_BALANCE = "load_balance"
+SMART_GROUP_MODES = {
+    SMART_GROUP_MODE_FAILOVER,
+    SMART_GROUP_MODE_MULTI_HOP,
+    SMART_GROUP_MODE_LOAD_BALANCE,
+}
+SMART_GROUP_LOAD_BALANCE_INTERVAL_DEFAULT = "5m"
+SMART_GROUP_LOAD_BALANCE_TOLERANCE_DEFAULT_MS = 50
 SERVER_QUALITY_HISTORY_LIMIT = 50
 QUALITY_EVENT_LATENCY = "latency"
 QUALITY_EVENT_SUCCESS = "success"
@@ -46,6 +56,22 @@ QUALITY_EVENT_TYPES = {
 def normalize_smart_strategy(value: str | None) -> str:
     text = str(value or "").strip().lower()
     return text if text in SMART_GROUP_STRATEGIES else SMART_STRATEGY_SMART
+
+
+def normalize_smart_group_mode(value: str | None) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "chain": SMART_GROUP_MODE_MULTI_HOP,
+        "multi": SMART_GROUP_MODE_MULTI_HOP,
+        "multihop": SMART_GROUP_MODE_MULTI_HOP,
+        "multi-hop": SMART_GROUP_MODE_MULTI_HOP,
+        "lb": SMART_GROUP_MODE_LOAD_BALANCE,
+        "balance": SMART_GROUP_MODE_LOAD_BALANCE,
+        "balancer": SMART_GROUP_MODE_LOAD_BALANCE,
+        "urltest": SMART_GROUP_MODE_LOAD_BALANCE,
+    }
+    text = aliases.get(text, text)
+    return text if text in SMART_GROUP_MODES else SMART_GROUP_MODE_FAILOVER
 
 
 def _clean_string_list(value: Any) -> list[str]:
@@ -146,6 +172,12 @@ class ServerQualityStats:
     last_checked_at: str | None = None
     cooldown_until: str | None = None
     history: list[ServerQualityEvent] = field(default_factory=list)
+    connection_count: int = 0
+    total_connected_seconds: int = 0
+    total_download_bytes: int = 0
+    total_upload_bytes: int = 0
+    last_connected_at: str | None = None
+    last_disconnected_at: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ServerQualityStats":
@@ -153,12 +185,28 @@ class ServerQualityStats:
         safe["profile_id"] = str(safe.get("profile_id") or "").strip()
         safe["latency_ewma_ms"] = _optional_float(safe.get("latency_ewma_ms"))
         safe["last_latency_ms"] = _optional_int(safe.get("last_latency_ms"))
-        for key in ("samples", "success_count", "failure_count", "consecutive_failures"):
+        for key in (
+            "samples",
+            "success_count",
+            "failure_count",
+            "consecutive_failures",
+            "connection_count",
+            "total_connected_seconds",
+            "total_download_bytes",
+            "total_upload_bytes",
+        ):
             try:
                 safe[key] = max(0, int(safe.get(key) or 0))
             except (TypeError, ValueError):
                 safe[key] = 0
-        for key in ("last_success_at", "last_failure_at", "last_checked_at", "cooldown_until"):
+        for key in (
+            "last_success_at",
+            "last_failure_at",
+            "last_checked_at",
+            "cooldown_until",
+            "last_connected_at",
+            "last_disconnected_at",
+        ):
             safe[key] = _optional_str(safe.get(key))
         raw_history = safe.get("history") or []
         if not isinstance(raw_history, list):
@@ -222,10 +270,26 @@ class ServerQualityStats:
     def last_event(self) -> ServerQualityEvent | None:
         return self.history[-1] if self.history else None
 
+    def record_usage(
+        self,
+        *,
+        connected_seconds: int,
+        download_bytes: int,
+        upload_bytes: int,
+        connected_at: str | None = None,
+        disconnected_at: str | None = None,
+    ) -> None:
+        self.connection_count += 1
+        self.total_connected_seconds += max(0, int(connected_seconds))
+        self.total_download_bytes += max(0, int(download_bytes))
+        self.total_upload_bytes += max(0, int(upload_bytes))
+        self.last_connected_at = _optional_str(connected_at) or self.last_connected_at
+        self.last_disconnected_at = _optional_str(disconnected_at) or utc_now_iso()
+
 
 @dataclass(slots=True)
 class SmartGroup:
-    """Пользовательская или автоматически созданная failover-группа серверов."""
+    """Пользовательская группа: failover, multi-hop chain или load-balance target."""
 
     id: str = field(default_factory=lambda: uuid4().hex)
     name: str = "Smart Group"
@@ -233,7 +297,16 @@ class SmartGroup:
     profile_ids: list[str] = field(default_factory=list)
     subscription_id: str | None = None
     source_group: str | None = None
+    mode: str = SMART_GROUP_MODE_FAILOVER
     strategy: str = SMART_STRATEGY_SMART
+    load_balance_interval: str = SMART_GROUP_LOAD_BALANCE_INTERVAL_DEFAULT
+    load_balance_tolerance_ms: int = SMART_GROUP_LOAD_BALANCE_TOLERANCE_DEFAULT_MS
+    usage_connection_count: int = 0
+    usage_total_seconds: int = 0
+    usage_total_download_bytes: int = 0
+    usage_total_upload_bytes: int = 0
+    usage_last_connected_at: str | None = None
+    usage_last_disconnected_at: str | None = None
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
 
@@ -246,16 +319,55 @@ class SmartGroup:
         safe["profile_ids"] = _clean_string_list(safe.get("profile_ids"))
         safe["subscription_id"] = _optional_str(safe.get("subscription_id"))
         safe["source_group"] = _optional_str(safe.get("source_group"))
+        safe["mode"] = normalize_smart_group_mode(safe.get("mode"))
         safe["strategy"] = normalize_smart_strategy(safe.get("strategy"))
+        interval = _optional_str(safe.get("load_balance_interval")) or SMART_GROUP_LOAD_BALANCE_INTERVAL_DEFAULT
+        safe["load_balance_interval"] = interval
+        tolerance = _optional_int(safe.get("load_balance_tolerance_ms"))
+        safe["load_balance_tolerance_ms"] = (
+            tolerance if tolerance is not None and tolerance >= 0 else SMART_GROUP_LOAD_BALANCE_TOLERANCE_DEFAULT_MS
+        )
+        for key in (
+            "usage_connection_count",
+            "usage_total_seconds",
+            "usage_total_download_bytes",
+            "usage_total_upload_bytes",
+        ):
+            try:
+                safe[key] = max(0, int(safe.get(key) or 0))
+            except (TypeError, ValueError):
+                safe[key] = 0
+        safe["usage_last_connected_at"] = _optional_str(safe.get("usage_last_connected_at"))
+        safe["usage_last_disconnected_at"] = _optional_str(safe.get("usage_last_disconnected_at"))
         safe["created_at"] = _optional_str(safe.get("created_at")) or utc_now_iso()
         safe["updated_at"] = _optional_str(safe.get("updated_at")) or safe["created_at"]
         return cls(**{key: safe[key] for key in cls.__dataclass_fields__ if key in safe})
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        data["mode"] = normalize_smart_group_mode(self.mode)
         data["strategy"] = normalize_smart_strategy(self.strategy)
         data["profile_ids"] = _clean_string_list(self.profile_ids)
+        data["load_balance_interval"] = _optional_str(self.load_balance_interval) or SMART_GROUP_LOAD_BALANCE_INTERVAL_DEFAULT
+        data["load_balance_tolerance_ms"] = max(0, int(self.load_balance_tolerance_ms))
         return data
 
     def touch(self) -> None:
         self.updated_at = utc_now_iso()
+
+    def record_usage(
+        self,
+        *,
+        connected_seconds: int,
+        download_bytes: int,
+        upload_bytes: int,
+        connected_at: str | None = None,
+        disconnected_at: str | None = None,
+    ) -> None:
+        self.usage_connection_count += 1
+        self.usage_total_seconds += max(0, int(connected_seconds))
+        self.usage_total_download_bytes += max(0, int(download_bytes))
+        self.usage_total_upload_bytes += max(0, int(upload_bytes))
+        self.usage_last_connected_at = _optional_str(connected_at) or self.usage_last_connected_at
+        self.usage_last_disconnected_at = _optional_str(disconnected_at) or utc_now_iso()
+        self.touch()

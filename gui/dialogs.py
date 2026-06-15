@@ -21,7 +21,8 @@ import re
 from dataclasses import dataclass
 from pathlib import PureWindowsPath
 
-from PyQt6.QtWidgets import QDialog, QGridLayout, QHBoxLayout, QMessageBox, QVBoxLayout, QWidget
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QDialog, QGridLayout, QHBoxLayout, QListWidget, QListWidgetItem, QMessageBox, QVBoxLayout, QWidget
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
@@ -42,6 +43,20 @@ from models.rules import (
     clean_process_paths,
     normalize_outbound,
 )
+from models.connection import (
+    SMART_GROUP_LOAD_BALANCE_INTERVAL_DEFAULT,
+    SMART_GROUP_LOAD_BALANCE_TOLERANCE_DEFAULT_MS,
+    SMART_GROUP_MODE_FAILOVER,
+    SMART_GROUP_MODE_LOAD_BALANCE,
+    SMART_GROUP_MODE_MULTI_HOP,
+    SMART_STRATEGY_FAILOVER_ORDER,
+    SMART_STRATEGY_LATENCY,
+    SMART_STRATEGY_SMART,
+    SmartGroup,
+    normalize_smart_group_mode,
+    normalize_smart_strategy,
+)
+from models.profile import VlessProfile
 from models.settings import AppSettings
 
 
@@ -84,6 +99,17 @@ class OnboardingResult:
     minimize_to_tray: bool
     auto_start_windows: bool
     action: str
+
+
+@dataclass(frozen=True, slots=True)
+class SmartGroupEditorData:
+    name: str
+    enabled: bool
+    mode: str
+    strategy: str
+    profile_ids: list[str]
+    load_balance_interval: str
+    load_balance_tolerance_ms: int
 
 
 def _filename_from_path(path: str) -> str:
@@ -136,7 +162,8 @@ class OnboardingDialog(QDialog):
         layout.addWidget(SubtitleLabel("Razreshenie VPN Client", self))
 
         subtitle = CaptionLabel(
-            "Быстрая настройка режима, фоновых проверок и первого действия после запуска.",
+            "Настройте базовый режим, восстановление соединения и первое действие. "
+            "VPN не будет подключён автоматически из мастера.",
             self,
         )
         subtitle.setWordWrap(True)
@@ -171,17 +198,17 @@ class OnboardingDialog(QDialog):
         form.addWidget(self.auto_start_switch, 4, 1)
 
         self.action_combo = ComboBox(self)
-        self.action_combo.addItem("Импортировать сервер", userData=ONBOARDING_ACTION_IMPORT_SERVER)
-        self.action_combo.addItem("Добавить подписку", userData=ONBOARDING_ACTION_ADD_SUBSCRIPTION)
-        self.action_combo.addItem("Скачать/обновить sing-box", userData=ONBOARDING_ACTION_DOWNLOAD_CORE)
-        self.action_combo.addItem("Открыть настройки", userData=ONBOARDING_ACTION_OPEN_SETTINGS)
+        self.action_combo.addItem("Импортировать первый сервер", userData=ONBOARDING_ACTION_IMPORT_SERVER)
+        self.action_combo.addItem("Добавить URL подписки", userData=ONBOARDING_ACTION_ADD_SUBSCRIPTION)
+        self.action_combo.addItem("Скачать/обновить sing-box core", userData=ONBOARDING_ACTION_DOWNLOAD_CORE)
+        self.action_combo.addItem("Открыть расширенные настройки", userData=ONBOARDING_ACTION_OPEN_SETTINGS)
         self.action_combo.addItem("Ничего, открыть приложение", userData=ONBOARDING_ACTION_SKIP)
         form.addWidget(BodyLabel("После мастера", self), 5, 0)
         form.addWidget(self.action_combo, 5, 1)
 
         note = CaptionLabel(
-            "TUN-режим может потребовать права администратора только при подключении. "
-            "Мастер не подключает VPN автоматически.",
+            "Proxy подходит для быстрого старта без администратора. TUN нужен для системного туннеля, "
+            "split tunneling и Kill Switch; при подключении он может запросить UAC.",
             self,
         )
         note.setWordWrap(True)
@@ -409,3 +436,218 @@ class PerAppRuleDialog(QDialog):
             return
         self._data = data
         self.accept()
+
+
+class SmartGroupEditorDialog(QDialog):
+    def __init__(
+        self,
+        group: SmartGroup,
+        profiles: list[VlessProfile],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Группа серверов")
+        self.resize(780, 560)
+        self._group = group
+        self._profiles = list(profiles)
+        self._profile_by_id = {profile.id: profile for profile in self._profiles}
+        self._data: SmartGroupEditorData | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+        layout.addWidget(SubtitleLabel("Группа серверов", self))
+        hint = CaptionLabel(
+            "Порядок списка используется как приоритет. В Multi-hop первый сервер является первым hop, последний - exit.",
+            self,
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(10)
+        layout.addLayout(form)
+
+        self.name_edit = LineEdit(self)
+        self.name_edit.setText(group.name)
+        form.addWidget(BodyLabel("Название", self), 0, 0)
+        form.addWidget(self.name_edit, 0, 1)
+
+        self.enabled_switch = SwitchButton(self)
+        self.enabled_switch.setChecked(group.enabled)
+        form.addWidget(BodyLabel("Включена", self), 1, 0)
+        form.addWidget(self.enabled_switch, 1, 1)
+
+        self.mode_combo = ComboBox(self)
+        self.mode_combo.addItem("Failover", userData=SMART_GROUP_MODE_FAILOVER)
+        self.mode_combo.addItem("Multi-hop", userData=SMART_GROUP_MODE_MULTI_HOP)
+        self.mode_combo.addItem("Load Balance", userData=SMART_GROUP_MODE_LOAD_BALANCE)
+        self._set_combo_data(self.mode_combo, normalize_smart_group_mode(group.mode))
+        form.addWidget(BodyLabel("Режим", self), 2, 0)
+        form.addWidget(self.mode_combo, 2, 1)
+
+        self.strategy_combo = ComboBox(self)
+        self.strategy_combo.addItem("Умный выбор", userData=SMART_STRATEGY_SMART)
+        self.strategy_combo.addItem("Минимальный пинг", userData=SMART_STRATEGY_LATENCY)
+        self.strategy_combo.addItem("По порядку", userData=SMART_STRATEGY_FAILOVER_ORDER)
+        self._set_combo_data(self.strategy_combo, normalize_smart_strategy(group.strategy))
+        form.addWidget(BodyLabel("Стратегия", self), 3, 0)
+        form.addWidget(self.strategy_combo, 3, 1)
+
+        self.interval_edit = LineEdit(self)
+        self.interval_edit.setText(group.load_balance_interval or SMART_GROUP_LOAD_BALANCE_INTERVAL_DEFAULT)
+        form.addWidget(BodyLabel("LB interval", self), 4, 0)
+        form.addWidget(self.interval_edit, 4, 1)
+
+        self.tolerance_edit = LineEdit(self)
+        self.tolerance_edit.setText(str(group.load_balance_tolerance_ms or SMART_GROUP_LOAD_BALANCE_TOLERANCE_DEFAULT_MS))
+        form.addWidget(BodyLabel("LB tolerance, ms", self), 5, 0)
+        form.addWidget(self.tolerance_edit, 5, 1)
+
+        add_row = QHBoxLayout()
+        add_row.setSpacing(8)
+        self.profile_combo = ComboBox(self)
+        self.profile_combo.setMinimumWidth(500)
+        self.add_btn = PushButton(FIF.ADD, "Добавить", self)
+        add_row.addWidget(self.profile_combo, 1)
+        add_row.addWidget(self.add_btn)
+        layout.addLayout(add_row)
+
+        self.members_list = QListWidget(self)
+        self.members_list.setMinimumHeight(170)
+        layout.addWidget(self.members_list, 1)
+
+        member_actions = QHBoxLayout()
+        member_actions.setSpacing(8)
+        self.up_btn = PushButton(FIF.UP, "Выше", self)
+        self.down_btn = PushButton(FIF.DOWN, "Ниже", self)
+        self.remove_btn = PushButton(FIF.DELETE, "Удалить", self)
+        member_actions.addWidget(self.up_btn)
+        member_actions.addWidget(self.down_btn)
+        member_actions.addWidget(self.remove_btn)
+        member_actions.addStretch(1)
+        layout.addLayout(member_actions)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.cancel_btn = PushButton("Отмена", self)
+        self.save_btn = PrimaryPushButton(FIF.ACCEPT, "Сохранить", self)
+        buttons.addWidget(self.cancel_btn)
+        buttons.addWidget(self.save_btn)
+        layout.addLayout(buttons)
+
+        self.add_btn.clicked.connect(self._add_selected_profile)
+        self.up_btn.clicked.connect(lambda: self._move_member(-1))
+        self.down_btn.clicked.connect(lambda: self._move_member(1))
+        self.remove_btn.clicked.connect(self._remove_selected_member)
+        self.mode_combo.currentIndexChanged.connect(lambda _index: self._sync_mode_controls())
+        self.cancel_btn.clicked.connect(self.reject)
+        self.save_btn.clicked.connect(self._accept_if_valid)
+
+        self._reload_profiles_combo()
+        for profile_id in group.profile_ids:
+            profile = self._profile_by_id.get(profile_id)
+            if profile:
+                self._append_member(profile)
+        self._sync_mode_controls()
+
+    def group_data(self) -> SmartGroupEditorData | None:
+        return self._data or self._build_data(show_errors=False)
+
+    def _reload_profiles_combo(self) -> None:
+        self.profile_combo.clear()
+        for profile in self._profiles:
+            self.profile_combo.addItem(self._profile_label(profile), userData=profile.id)
+
+    def _append_member(self, profile: VlessProfile) -> None:
+        item = QListWidgetItem(self._profile_label(profile))
+        item.setData(Qt.ItemDataRole.UserRole, profile.id)
+        self.members_list.addItem(item)
+
+    def _add_selected_profile(self) -> None:
+        profile_id = str(self.profile_combo.currentData() or "")
+        profile = self._profile_by_id.get(profile_id)
+        if not profile:
+            return
+        if profile_id in self._member_ids():
+            return
+        self._append_member(profile)
+        self.members_list.setCurrentRow(self.members_list.count() - 1)
+
+    def _move_member(self, direction: int) -> None:
+        row = self.members_list.currentRow()
+        target = row + int(direction)
+        if row < 0 or target < 0 or target >= self.members_list.count():
+            return
+        item = self.members_list.takeItem(row)
+        self.members_list.insertItem(target, item)
+        self.members_list.setCurrentRow(target)
+
+    def _remove_selected_member(self) -> None:
+        row = self.members_list.currentRow()
+        if row >= 0:
+            self.members_list.takeItem(row)
+
+    def _member_ids(self) -> list[str]:
+        result: list[str] = []
+        for index in range(self.members_list.count()):
+            item = self.members_list.item(index)
+            profile_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if profile_id:
+                result.append(profile_id)
+        return result
+
+    def _sync_mode_controls(self) -> None:
+        mode = normalize_smart_group_mode(str(self.mode_combo.currentData() or ""))
+        load_balance = mode == SMART_GROUP_MODE_LOAD_BALANCE
+        self.interval_edit.setEnabled(load_balance)
+        self.tolerance_edit.setEnabled(load_balance)
+        self.strategy_combo.setEnabled(mode == SMART_GROUP_MODE_FAILOVER)
+
+    def _build_data(self, *, show_errors: bool) -> SmartGroupEditorData | None:
+        name = self.name_edit.text().strip() or "Smart Group"
+        mode = normalize_smart_group_mode(str(self.mode_combo.currentData() or ""))
+        strategy = normalize_smart_strategy(str(self.strategy_combo.currentData() or ""))
+        profile_ids = self._member_ids()
+        minimum = 2 if mode in {SMART_GROUP_MODE_MULTI_HOP, SMART_GROUP_MODE_LOAD_BALANCE} else 1
+        if len(profile_ids) < minimum:
+            self._warn(show_errors, "Для выбранного режима недостаточно серверов в группе.")
+            return None
+        interval = self.interval_edit.text().strip() or SMART_GROUP_LOAD_BALANCE_INTERVAL_DEFAULT
+        try:
+            tolerance = int(self.tolerance_edit.text().strip() or SMART_GROUP_LOAD_BALANCE_TOLERANCE_DEFAULT_MS)
+        except ValueError:
+            self._warn(show_errors, "LB tolerance должен быть числом.")
+            return None
+        return SmartGroupEditorData(
+            name=name,
+            enabled=self.enabled_switch.isChecked(),
+            mode=mode,
+            strategy=strategy,
+            profile_ids=profile_ids,
+            load_balance_interval=interval,
+            load_balance_tolerance_ms=max(0, tolerance),
+        )
+
+    def _accept_if_valid(self) -> None:
+        data = self._build_data(show_errors=True)
+        if not data:
+            return
+        self._data = data
+        self.accept()
+
+    def _warn(self, enabled: bool, message: str) -> None:
+        if enabled:
+            QMessageBox.warning(self, "Некорректная группа", message)
+
+    @staticmethod
+    def _profile_label(profile: VlessProfile) -> str:
+        return f"{profile.name} [{profile.protocol}] ({profile.address}:{profile.port})"
+
+    @staticmethod
+    def _set_combo_data(combo: ComboBox, value: str) -> None:
+        for index in range(combo.count()):
+            if combo.itemData(index) == value:
+                combo.setCurrentIndex(index)
+                return

@@ -58,7 +58,8 @@ from core.domain_activity import (
     DomainActivitySummary,
     summarize_domain_activity,
 )
-from models.rules import ROUTE_OUTBOUND_DIRECT, ROUTE_OUTBOUND_PROXY, normalize_outbound
+from gui.common import apply_card_layout, apply_page_layout, polish_table, polish_toolbar_buttons
+from models.rules import ROUTE_OUTBOUND_DIRECT, ROUTE_OUTBOUND_PROXY, domain_site_suffix, normalize_outbound
 
 
 ACTIVITY_ACTION_PROXY_COLUMN = 7
@@ -104,9 +105,9 @@ class DomainActivityTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.ToolTipRole:
             entry = self._entries[row]
             if column == ACTIVITY_ACTION_PROXY_COLUMN:
-                return f"Добавить домен {entry.domain} в правила через VPN"
+                return f"Добавить домен {entry.domain} через VPN"
             if column == ACTIVITY_ACTION_DIRECT_COLUMN:
-                return f"Добавить зону сайта для {entry.domain} в правила напрямую"
+                return f"Добавить зону {domain_site_suffix(entry.domain) or entry.domain} напрямую"
             return f"{entry.domain}\n{entry.rule_name}\n{entry.hits} событий"
         if role == Qt.ItemDataRole.ForegroundRole:
             route = self._routes[row]
@@ -187,8 +188,7 @@ class DomainActivityPage(QWidget):
         super().__init__(parent)
         self.setObjectName("domain_activity")
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 20, 24, 20)
-        root.setSpacing(12)
+        apply_page_layout(root)
         root.addWidget(SubtitleLabel("Активность доменов", self))
         hint = CaptionLabel(
             "Свежие домены и поддомены из runtime-логов sing-box с маршрутом VPN или напрямую.",
@@ -226,8 +226,7 @@ class DomainActivityPage(QWidget):
         )
         self.share_card = CardWidget(self)
         share_layout = QVBoxLayout(self.share_card)
-        share_layout.setContentsMargins(14, 10, 14, 10)
-        share_layout.setSpacing(4)
+        apply_card_layout(share_layout)
         share_layout.addWidget(StrongBodyLabel("VPN-доля", self.share_card))
         self.vpn_share_value = BodyLabel("0%", self.share_card)
         self.vpn_share_caption = CaptionLabel("по событиям Live Activity", self.share_card)
@@ -244,8 +243,10 @@ class DomainActivityPage(QWidget):
         root.addLayout(summary_grid)
 
         toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
         self.search = SearchLineEdit(self)
         self.search.setPlaceholderText("Поиск: домен, правило, маршрут")
+        self.search.setClearButtonEnabled(True)
         self.route_combo = ComboBox(self)
         self.route_combo.addItem("Все маршруты", userData="all")
         self.route_combo.addItem("Через VPN", userData=ROUTE_OUTBOUND_PROXY)
@@ -270,6 +271,16 @@ class DomainActivityPage(QWidget):
         self.create_rule_btn = PrimaryPushButton(FIF.ADD, "В правило", self)
         self.create_rule_btn.setEnabled(False)
         self.clear_btn = PushButton(FIF.DELETE, "Очистить", self)
+        polish_toolbar_buttons(
+            self.route_combo,
+            self.rule_filter_combo,
+            self.sort_combo,
+            self.rule_match_combo,
+            self.rule_outbound_combo,
+            self.create_rule_btn,
+            self.clear_btn,
+            min_width=112,
+        )
         toolbar.addWidget(self.search, 1)
         toolbar.addWidget(self.route_combo)
         toolbar.addWidget(self.rule_filter_combo)
@@ -279,6 +290,50 @@ class DomainActivityPage(QWidget):
         toolbar.addWidget(self.create_rule_btn)
         toolbar.addWidget(self.clear_btn)
         root.addLayout(toolbar)
+
+        self.selection_card = CardWidget(self)
+        selection_layout = QVBoxLayout(self.selection_card)
+        apply_card_layout(selection_layout)
+        self.selected_domain_label = StrongBodyLabel("Домен не выбран", self.selection_card)
+        self.selected_meta_label = CaptionLabel("Маршрут: - · Правило: - · Событий: -", self.selection_card)
+        self.selected_meta_label.setWordWrap(True)
+        selection_layout.addWidget(self.selected_domain_label)
+        selection_layout.addWidget(self.selected_meta_label)
+        self.rule_preview_label = BodyLabel("Правило: -", self.selection_card)
+        self.rule_preview_label.setWordWrap(True)
+        selection_layout.addWidget(self.rule_preview_label)
+
+        quick_actions = QGridLayout()
+        quick_actions.setSpacing(8)
+        self.direct_zone_btn = PushButton(FIF.ADD, "Зону напрямую", self.selection_card)
+        self.direct_domain_btn = PushButton(FIF.ADD, "Домен напрямую", self.selection_card)
+        self.proxy_domain_btn = PushButton(FIF.ADD, "Домен через VPN", self.selection_card)
+        self.proxy_zone_btn = PushButton(FIF.ADD, "Зону через VPN", self.selection_card)
+        self.copy_domain_btn = PushButton("Копировать", self.selection_card)
+        polish_toolbar_buttons(
+            self.direct_zone_btn,
+            self.direct_domain_btn,
+            self.proxy_domain_btn,
+            self.proxy_zone_btn,
+            self.copy_domain_btn,
+            min_width=132,
+        )
+        for button in (
+            self.direct_zone_btn,
+            self.direct_domain_btn,
+            self.proxy_domain_btn,
+            self.proxy_zone_btn,
+            self.copy_domain_btn,
+        ):
+            button.setEnabled(False)
+        quick_actions.addWidget(self.direct_zone_btn, 0, 0)
+        quick_actions.addWidget(self.direct_domain_btn, 0, 1)
+        quick_actions.addWidget(self.proxy_domain_btn, 0, 2)
+        quick_actions.addWidget(self.proxy_zone_btn, 1, 0)
+        quick_actions.addWidget(self.copy_domain_btn, 1, 1)
+        quick_actions.setColumnStretch(3, 1)
+        selection_layout.addLayout(quick_actions)
+        root.addWidget(self.selection_card)
 
         self.activity_model = DomainActivityTableModel(self)
         self.table = QTableView(self)
@@ -300,13 +355,29 @@ class DomainActivityPage(QWidget):
         for col in (1, 3, 4, 5, 6, 7, 8):
             self.table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        polish_table(self.table, row_height=30)
         root.addWidget(self.table, 1)
 
         self.search.textChanged.connect(lambda _text: self.filters_changed.emit())
         self.route_combo.currentIndexChanged.connect(lambda _index: self.filters_changed.emit())
         self.rule_filter_combo.currentIndexChanged.connect(lambda _index: self.filters_changed.emit())
         self.sort_combo.currentIndexChanged.connect(lambda _index: self.filters_changed.emit())
+        self.rule_match_combo.currentIndexChanged.connect(lambda _index: self._sync_actions())
+        self.rule_outbound_combo.currentIndexChanged.connect(lambda _index: self._sync_actions())
         self.create_rule_btn.clicked.connect(self._emit_selected_route_rule)
+        self.direct_zone_btn.clicked.connect(
+            lambda _checked=False: self._emit_selected_quick_rule("domain_suffix", ROUTE_OUTBOUND_DIRECT)
+        )
+        self.direct_domain_btn.clicked.connect(
+            lambda _checked=False: self._emit_selected_quick_rule("domain", ROUTE_OUTBOUND_DIRECT)
+        )
+        self.proxy_domain_btn.clicked.connect(
+            lambda _checked=False: self._emit_selected_quick_rule("domain", ROUTE_OUTBOUND_PROXY)
+        )
+        self.proxy_zone_btn.clicked.connect(
+            lambda _checked=False: self._emit_selected_quick_rule("domain_suffix", ROUTE_OUTBOUND_PROXY)
+        )
+        self.copy_domain_btn.clicked.connect(self._copy_selected_domain)
         self.table.clicked.connect(self._handle_table_click)
         self.table.doubleClicked.connect(self._handle_table_double_click)
         self.table.customContextMenuRequested.connect(self._open_context_menu)
@@ -324,8 +395,7 @@ class DomainActivityPage(QWidget):
     ) -> tuple[BodyLabel, CaptionLabel]:
         card = CardWidget(self)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(3)
+        apply_card_layout(layout)
         layout.addWidget(StrongBodyLabel(title, card))
         value_label = BodyLabel(value, card)
         caption_label = CaptionLabel(caption, card)
@@ -371,7 +441,33 @@ class DomainActivityPage(QWidget):
         return self.activity_model.entry_at(index.row())
 
     def _sync_actions(self) -> None:
-        self.create_rule_btn.setEnabled(self.selected_entry() is not None)
+        entry = self.selected_entry()
+        has_entry = entry is not None
+        self.create_rule_btn.setEnabled(has_entry)
+        for button in (
+            self.direct_zone_btn,
+            self.direct_domain_btn,
+            self.proxy_domain_btn,
+            self.proxy_zone_btn,
+            self.copy_domain_btn,
+        ):
+            button.setEnabled(has_entry)
+
+        if not entry:
+            self.create_rule_btn.setText("В правило")
+            self.selected_domain_label.setText("Домен не выбран")
+            self.selected_meta_label.setText("Маршрут: - · Правило: - · Событий: -")
+            self.rule_preview_label.setText("Правило: -")
+            return
+
+        match_kind = self._rule_match_kind()
+        outbound = self._rule_outbound()
+        self.create_rule_btn.setText(f"Добавить {self._match_kind_label(match_kind)} {self._outbound_label(outbound)}")
+        self.selected_domain_label.setText(entry.domain)
+        self.selected_meta_label.setText(
+            f"Маршрут: {entry.route_label} · Правило: {entry.rule_name} · Событий: {entry.hits}"
+        )
+        self.rule_preview_label.setText(self._rule_preview(entry, match_kind, outbound))
 
     def _set_summary(self, summary: DomainActivitySummary) -> None:
         self.total_value.setText(str(summary.total_domains))
@@ -409,8 +505,19 @@ class DomainActivityPage(QWidget):
             return
         self._emit_route_rule(entry.domain, self._rule_match_kind(), self._rule_outbound())
 
+    def _emit_selected_quick_rule(self, match_kind: str, outbound: str) -> None:
+        entry = self.selected_entry()
+        if not entry:
+            return
+        self._emit_route_rule(entry.domain, match_kind, outbound)
+
     def _emit_route_rule(self, domain: str, match_kind: str, outbound: str) -> None:
         self.route_rule_requested.emit(domain, match_kind, normalize_outbound(outbound))
+
+    def _copy_selected_domain(self) -> None:
+        entry = self.selected_entry()
+        if entry:
+            QApplication.clipboard().setText(entry.domain)
 
     def _rule_match_kind(self) -> str:
         value = str(self.rule_match_combo.currentData() or "domain")
@@ -418,6 +525,19 @@ class DomainActivityPage(QWidget):
 
     def _rule_outbound(self) -> str:
         return normalize_outbound(str(self.rule_outbound_combo.currentData() or ROUTE_OUTBOUND_DIRECT))
+
+    @staticmethod
+    def _match_kind_label(match_kind: str) -> str:
+        return "зону" if match_kind == "domain_suffix" else "домен"
+
+    @staticmethod
+    def _outbound_label(outbound: str) -> str:
+        return "напрямую" if normalize_outbound(outbound) == ROUTE_OUTBOUND_DIRECT else "через VPN"
+
+    def _rule_preview(self, entry: DomainActivityEntry, match_kind: str, outbound: str) -> str:
+        target = domain_site_suffix(entry.domain) if match_kind == "domain_suffix" else entry.domain
+        target = target or entry.domain
+        return f"Будет добавлено: {target} -> {self._outbound_label(outbound)}"
 
     def _entry_at_point(self, point) -> DomainActivityEntry | None:
         index = self.table.indexAt(point)

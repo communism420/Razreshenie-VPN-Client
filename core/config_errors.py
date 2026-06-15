@@ -13,24 +13,8 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 # GNU General Public License for more details.
 
-"""Страницы PyQt6 GUI."""
+"""Shared sing-box config build errors."""
 
-from gui.pages.about import AboutPage
-from gui.pages.activity import DomainActivityPage
-from gui.pages.dashboard import DashboardPage
-from gui.pages.logs import LogsPage
-from gui.pages.routing import RoutingPage
-from gui.pages.servers import ServersPage
-from gui.pages.settings import SettingsPage
-from gui.pages.subscriptions import SubscriptionsPage
 
-__all__ = [
-    "AboutPage",
-    "DashboardPage",
-    "DomainActivityPage",
-    "LogsPage",
-    "RoutingPage",
-    "ServersPage",
-    "SettingsPage",
-    "SubscriptionsPage",
-]
+class ConfigBuildError(ValueError):
+    """Ошибка генерации конфигурации sing-box."""

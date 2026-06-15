@@ -21,7 +21,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtGui import QFont, QFontDatabase, QIcon, QPainter, QPixmap
-from PyQt6.QtWidgets import QLabel, QWidget
+from PyQt6.QtWidgets import QAbstractItemView, QLabel, QLayout, QWidget
 
 from models.profile import ServerProfile
 from utils import paths
@@ -30,6 +30,37 @@ from utils import paths
 ACCENT = "#0078D4"
 DANGER = "#D83B01"
 SUCCESS = "#16C60C"
+WARNING = "#F9A825"
+MUTED = "#B8B8B8"
+PAGE_MARGINS = (24, 20, 24, 20)
+PAGE_SPACING = 12
+CARD_MARGINS = (18, 14, 18, 14)
+CARD_SPACING = 8
+TOOLBAR_SPACING = 8
+TABLE_STYLE = """
+QTableView {
+    border: 1px solid rgba(255, 255, 255, 18);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 6);
+    alternate-background-color: rgba(255, 255, 255, 4);
+}
+QTableView::item {
+    padding: 4px 6px;
+}
+QHeaderView::section {
+    background: rgba(255, 255, 255, 12);
+    border: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 18);
+    padding: 6px 8px;
+}
+"""
+BADGE_STYLES = {
+    "accent": ("#8EC5FF", "rgba(0, 120, 212, 42)"),
+    "success": ("#85E89D", "rgba(22, 198, 12, 36)"),
+    "warning": ("#FFD37A", "rgba(249, 168, 37, 36)"),
+    "danger": ("#FFB4A2", "rgba(216, 59, 1, 36)"),
+    "muted": (MUTED, "rgba(255, 255, 255, 18)"),
+}
 EMOJI_FONT_CANDIDATES = (
     "Segoe UI Emoji",
     "Segoe UI Symbol",
@@ -212,3 +243,55 @@ def create_logo_label(parent: QWidget, size: int = 56) -> QLabel:
     label.setPixmap(app_logo_pixmap(size))
     label.setStyleSheet("QLabel { background: transparent; }")
     return label
+
+
+def apply_page_layout(layout: QLayout) -> None:
+    """Apply the shared page padding used by the main sections."""
+    layout.setContentsMargins(*PAGE_MARGINS)
+    layout.setSpacing(PAGE_SPACING)
+
+
+def apply_card_layout(layout: QLayout) -> None:
+    """Apply compact card padding without changing the card's own widget style."""
+    layout.setContentsMargins(*CARD_MARGINS)
+    layout.setSpacing(CARD_SPACING)
+
+
+def polish_table(table: QWidget, *, row_height: int = 32) -> None:
+    """Make table-like widgets consistent across feature pages."""
+    if hasattr(table, "setAlternatingRowColors"):
+        table.setAlternatingRowColors(True)
+    if hasattr(table, "setWordWrap"):
+        table.setWordWrap(False)
+    if hasattr(table, "setShowGrid"):
+        table.setShowGrid(False)
+    if hasattr(table, "setHorizontalScrollMode"):
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+    if hasattr(table, "setVerticalScrollMode"):
+        table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+    if hasattr(table, "verticalHeader"):
+        vertical_header = table.verticalHeader()
+        vertical_header.setVisible(False)
+        vertical_header.setDefaultSectionSize(row_height)
+    if hasattr(table, "horizontalHeader"):
+        horizontal_header = table.horizontalHeader()
+        horizontal_header.setHighlightSections(False)
+        horizontal_header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+    table.setStyleSheet(TABLE_STYLE)
+
+
+def polish_toolbar_buttons(*buttons: QWidget, min_width: int = 108) -> None:
+    """Keep action rows scannable while still allowing localized labels."""
+    for button in buttons:
+        button.setMinimumWidth(min_width)
+
+
+def style_badge_label(label: QWidget, tone: str = "muted") -> None:
+    foreground, background = BADGE_STYLES.get(tone, BADGE_STYLES["muted"])
+    label.setStyleSheet(
+        "padding: 2px 8px;"
+        "border-radius: 8px;"
+        f"color: {foreground};"
+        f"background: {background};"
+        "font-weight: 700;"
+    )
