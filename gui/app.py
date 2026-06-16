@@ -2109,9 +2109,10 @@ class RazreshenieWindow(FluentWindow):
         dialog.setWindowTitle("Заменить текущий EXE?")
         dialog.setText("Обновление готово к установке")
         dialog.setInformativeText(
-            "Приложение остановит VPN, закроется и заменит текущий EXE новой версией.\n\n"
-            f"Новый файл: {plan.install_path}\n"
-            f"Текущий файл будет удалён: {plan.current_executable}"
+            "Приложение остановит VPN, закроется и заменит текущий EXE по тому же пути.\n"
+            "Если старый файл ещё занят Windows, установщик дождётся выхода процесса и попробует принудительно завершить его.\n\n"
+            f"Путь замены: {plan.install_path}\n"
+            f"Временный файл обновления: {plan.downloaded_path}"
         )
         install_button = dialog.addButton("Закрыть и заменить", QMessageBox.ButtonRole.AcceptRole)
         folder_button = dialog.addButton("Открыть папку", QMessageBox.ButtonRole.ActionRole)

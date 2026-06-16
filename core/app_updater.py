@@ -76,6 +76,7 @@ class PreparedInPlaceUpdate:
     script_path: Path
     current_executable: Path
     install_path: Path
+    process_id: int
 
 
 def app_release_api_url(repository_url: str = APP_REPOSITORY) -> str:
@@ -267,7 +268,7 @@ def prepare_in_place_update(
 
     updates_dir = updates_dir or (paths.ensure_app_dirs()["downloads"] / APP_UPDATES_DIR_NAME)
     updates_dir.mkdir(parents=True, exist_ok=True)
-    install_path = executable.parent / _safe_filename(downloaded.name)
+    install_path = executable
     script_path = updates_dir / f"apply-update-{int(time.time())}.bat"
     backup_path = executable.with_suffix(executable.suffix + ".old")
     log_path = updates_dir / "apply-update.log"
@@ -278,6 +279,7 @@ def prepare_in_place_update(
             install_path=install_path,
             backup_path=backup_path,
             log_path=log_path,
+            process_id=os.getpid(),
         ),
         encoding="utf-8",
         newline="\r\n",
@@ -287,6 +289,7 @@ def prepare_in_place_update(
         script_path=script_path,
         current_executable=executable,
         install_path=install_path,
+        process_id=os.getpid(),
     )
 
 
@@ -433,53 +436,97 @@ def _build_in_place_update_script(
     install_path: Path,
     backup_path: Path,
     log_path: Path,
+    process_id: int,
 ) -> str:
     old_value = _batch_value(current_executable)
     new_value = _batch_value(downloaded_update)
     install_value = _batch_value(install_path)
     backup_value = _batch_value(backup_path)
     log_value = _batch_value(log_path)
+    pid_value = str(max(0, int(process_id)))
     return f"""@echo off
-setlocal
+setlocal EnableExtensions
 set "OLD={old_value}"
 set "NEW={new_value}"
 set "INSTALL={install_value}"
 set "BACKUP={backup_value}"
 set "LOG={log_value}"
+set "PID={pid_value}"
 echo [%date% %time%] Applying Razreshenie VPN Client update>"%LOG%"
-ping -n 3 127.0.0.1 >nul
-if /I "%INSTALL%"=="%OLD%" goto same_path
-if exist "%INSTALL%" del /f /q "%INSTALL%" >>"%LOG%" 2>&1
-move /y "%NEW%" "%INSTALL%" >>"%LOG%" 2>&1
-if errorlevel 1 goto launch_old
-for /l %%i in (1,1,60) do (
-    del /f /q "%OLD%" >>"%LOG%" 2>&1
-    if not exist "%OLD%" goto launch_new
-    ping -n 2 127.0.0.1 >nul
-)
-goto launch_new
-:same_path
-for /l %%i in (1,1,60) do (
-    move /y "%OLD%" "%BACKUP%" >>"%LOG%" 2>&1
-    if not exist "%OLD%" goto replace_same
-    ping -n 2 127.0.0.1 >nul
-)
-goto launch_old
-:replace_same
-move /y "%NEW%" "%OLD%" >>"%LOG%" 2>&1
+call :log Current EXE: "%OLD%"
+call :log Downloaded EXE: "%NEW%"
+call :log Target EXE: "%INSTALL%"
+if not exist "%NEW%" goto fail_missing_new
+if /I not "%INSTALL%"=="%OLD%" goto fail_bad_target
+call :wait_for_app_exit
+call :replace_current_exe
 if errorlevel 1 goto restore_old
-del /f /q "%BACKUP%" >>"%LOG%" 2>&1
+call :log Update installed successfully.
 start "" "%OLD%"
 goto cleanup
+
+:wait_for_app_exit
+if "%PID%"=="0" exit /b 0
+call :log Waiting for process PID %PID% to exit.
+for /l %%i in (1,1,45) do (
+    tasklist /FI "PID eq %PID%" /NH 2>nul | findstr /R /C:"[ ][ ]*%PID%[ ][ ]*" >nul
+    if errorlevel 1 exit /b 0
+    ping -n 2 127.0.0.1 >nul
+)
+call :log Process is still running; forcing termination.
+taskkill /PID %PID% /T /F >>"%LOG%" 2>&1
+for /l %%i in (1,1,20) do (
+    tasklist /FI "PID eq %PID%" /NH 2>nul | findstr /R /C:"[ ][ ]*%PID%[ ][ ]*" >nul
+    if errorlevel 1 exit /b 0
+    ping -n 2 127.0.0.1 >nul
+)
+exit /b 0
+
+:replace_current_exe
+if exist "%BACKUP%" del /f /q "%BACKUP%" >>"%LOG%" 2>&1
+for /l %%i in (1,1,90) do (
+    if not exist "%OLD%" goto install_new
+    attrib -r -s -h "%OLD%" >>"%LOG%" 2>&1
+    move /y "%OLD%" "%BACKUP%" >>"%LOG%" 2>&1
+    if not exist "%OLD%" goto install_new
+    del /f /q "%OLD%" >>"%LOG%" 2>&1
+    if not exist "%OLD%" goto install_new
+    ping -n 2 127.0.0.1 >nul
+)
+call :log Failed to remove or move the old EXE.
+exit /b 1
+
+:install_new
+copy /y "%NEW%" "%OLD%" >>"%LOG%" 2>&1
+if errorlevel 1 exit /b 1
+if not exist "%OLD%" exit /b 1
+for %%A in ("%OLD%") do if %%~zA LEQ 0 exit /b 1
+del /f /q "%NEW%" >>"%LOG%" 2>&1
+if exist "%BACKUP%" del /f /q "%BACKUP%" >>"%LOG%" 2>&1
+exit /b 0
+
 :restore_old
-move /y "%BACKUP%" "%OLD%" >>"%LOG%" 2>&1
+call :log Update failed; trying to restore the old EXE.
+if exist "%OLD%" del /f /q "%OLD%" >>"%LOG%" 2>&1
+if exist "%BACKUP%" move /y "%BACKUP%" "%OLD%" >>"%LOG%" 2>&1
 goto launch_old
-:launch_new
-start "" "%INSTALL%"
-goto cleanup
+
+:fail_missing_new
+call :log Downloaded EXE does not exist.
+goto launch_old
+
+:fail_bad_target
+call :log Internal error: install path is not the current EXE path.
+goto launch_old
+
 :launch_old
 if exist "%OLD%" start "" "%OLD%"
 goto cleanup
+
+:log
+echo [%date% %time%] %*>>"%LOG%"
+exit /b 0
+
 :cleanup
 del /f /q "%~f0" >nul 2>&1
 exit /b 0

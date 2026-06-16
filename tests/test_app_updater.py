@@ -18,8 +18,8 @@ class AppUpdaterTests(unittest.TestCase):
             self.skipTest("in-place EXE update script is Windows-only")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            current = root / "Razreshenie VPN Client 3.1.0.exe"
-            update = root / "downloads" / "Razreshenie VPN Client 3.3.0.exe"
+            current = root / "Razreshenie VPN Client 3.3.0.exe"
+            update = root / "downloads" / "Razreshenie VPN Client 3.3.1.exe"
             current.write_bytes(b"old")
             update.parent.mkdir()
             update.write_bytes(b"new")
@@ -32,12 +32,17 @@ class AppUpdaterTests(unittest.TestCase):
             )
 
             self.assertEqual(plan.current_executable, current)
-            self.assertEqual(plan.install_path, root / "Razreshenie VPN Client 3.3.0.exe")
+            self.assertEqual(plan.install_path, current)
+            self.assertGreater(plan.process_id, 0)
             self.assertTrue(plan.script_path.exists())
             script = plan.script_path.read_text(encoding="utf-8")
             self.assertIn(str(current), script)
-            self.assertIn(str(plan.install_path), script)
-            self.assertIn("del /f /q \"%OLD%\"", script)
+            self.assertIn(str(update), script)
+            self.assertIn("tasklist /FI \"PID eq %PID%\"", script)
+            self.assertIn("taskkill /PID %PID% /T /F", script)
+            self.assertIn("move /y \"%OLD%\" \"%BACKUP%\"", script)
+            self.assertIn("copy /y \"%NEW%\" \"%OLD%\"", script)
+            self.assertIn("move /y \"%BACKUP%\" \"%OLD%\"", script)
 
     def test_prepare_in_place_update_rejects_non_exe_asset(self) -> None:
         if os.name != "nt":
