@@ -2264,8 +2264,11 @@ class RazreshenieWindow(FluentWindow):
 
     def _status_loop(self) -> None:
         running = self.singbox.is_running()
-        if not running and self.resilience.last_connection_running:
+        if not running and self.resilience.should_report_core_stop(closing=self._closing):
             self._handle_unexpected_core_stop()
+        elif not running and self.resilience.manual_disconnect_requested:
+            self.singbox.mark_stopped_if_exited()
+            self.resilience.mark_core_stopped()
         elif running:
             self.resilience.last_connection_running = True
         elif not self.resilience.failover_in_progress:

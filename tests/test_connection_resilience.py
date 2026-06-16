@@ -223,6 +223,22 @@ class ResilienceServiceTests(unittest.TestCase):
         self.assertFalse(second.allowed)
         self.assertIn("лимит", second.message)
 
+    def test_manual_disconnect_does_not_report_core_stop(self) -> None:
+        resilience = ResilienceService(
+            connection_service=connection_service(),
+            logger=test_logger("tests.resilience"),
+            scan_limit=4,
+        )
+
+        resilience.on_connected()
+        self.assertTrue(resilience.should_report_core_stop(closing=False))
+
+        resilience.mark_manual_disconnect_requested()
+        self.assertFalse(resilience.should_report_core_stop(closing=False))
+
+        resilience.mark_core_stopped()
+        self.assertFalse(resilience.last_connection_running)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -383,6 +383,9 @@ class ResilienceService:
         self.last_connection_running = False
         self.health_check_running = False
 
+    def should_report_core_stop(self, *, closing: bool) -> bool:
+        return bool(self.last_connection_running and not self.manual_disconnect_requested and not closing)
+
     def should_self_heal_after_drop(
         self,
         profile: VlessProfile | None,

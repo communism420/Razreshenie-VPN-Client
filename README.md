@@ -2,7 +2,7 @@
 
 **Razreshenie VPN Client** - открытый Windows VPN-клиент на Python, PyQt6 и sing-box.
 
-**Версия:** `3.2.0`
+**Версия:** `3.2.1`
 
 Слоган: **«Разреши себе доступ к любым сайтам»**.
 
@@ -73,7 +73,7 @@ python main.py --self-check
 
 ```powershell
 pyinstaller --noconfirm --clean --onefile --windowed `
-  --name "Razreshenie VPN Client 3.2.0" `
+  --name "Razreshenie VPN Client 3.2.1" `
   --icon assets\app.ico `
   --version-file tools\windows_version_info.txt `
   --collect-data qfluentwidgets `

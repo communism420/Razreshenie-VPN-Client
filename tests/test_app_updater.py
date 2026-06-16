@@ -19,7 +19,7 @@ class AppUpdaterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             current = root / "Razreshenie VPN Client 3.1.0.exe"
-            update = root / "downloads" / "Razreshenie VPN Client 3.2.0.exe"
+            update = root / "downloads" / "Razreshenie VPN Client 3.2.1.exe"
             current.write_bytes(b"old")
             update.parent.mkdir()
             update.write_bytes(b"new")
@@ -32,7 +32,7 @@ class AppUpdaterTests(unittest.TestCase):
             )
 
             self.assertEqual(plan.current_executable, current)
-            self.assertEqual(plan.install_path, root / "Razreshenie VPN Client 3.2.0.exe")
+            self.assertEqual(plan.install_path, root / "Razreshenie VPN Client 3.2.1.exe")
             self.assertTrue(plan.script_path.exists())
             script = plan.script_path.read_text(encoding="utf-8")
             self.assertIn(str(current), script)
