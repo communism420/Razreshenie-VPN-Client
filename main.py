@@ -231,6 +231,8 @@ def run_self_check() -> int:
     update_settings = AppSettings.from_dict({"auto_check_app_updates": "yes"})
     assert update_settings.auto_check_app_updates is True
     assert AppSettings.from_dict({"auto_check_app_updates": "no"}).auto_check_app_updates is False
+    assert AppSettings.from_dict({"app_update_mode": "replace"}).app_update_mode == "replace_current"
+    assert AppSettings.from_dict({"app_update_mode": "unknown"}).app_update_mode == "download_only"
     assert AppSettings().smart_connect_enabled is True
     assert AppSettings.from_dict({"smart_connect_enabled": "off"}).smart_connect_enabled is False
     assert app_release_api_url("https://github.com/communism420/Razreshenie-VPN-Client").endswith(

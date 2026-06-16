@@ -19,8 +19,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import os
 from pathlib import Path
 import re
+import subprocess
+import sys
+import time
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
@@ -64,6 +68,14 @@ class AppUpdateInfo:
     @property
     def asset_name(self) -> str:
         return self.asset.name if self.asset else ""
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedInPlaceUpdate:
+    downloaded_path: Path
+    script_path: Path
+    current_executable: Path
+    install_path: Path
 
 
 def app_release_api_url(repository_url: str = APP_REPOSITORY) -> str:
@@ -225,6 +237,75 @@ def download_update_asset(
     return target
 
 
+def current_executable_can_be_replaced(current_executable: Path | None = None) -> bool:
+    executable = Path(current_executable or sys.executable)
+    return os.name == "nt" and executable.suffix.lower() == ".exe" and bool(getattr(sys, "frozen", False))
+
+
+def prepare_in_place_update(
+    downloaded_update: Path,
+    *,
+    current_executable: Path | None = None,
+    updates_dir: Path | None = None,
+    require_frozen: bool = True,
+) -> PreparedInPlaceUpdate:
+    """Готовит Windows batch-файл, который заменит текущий EXE после выхода приложения."""
+    if os.name != "nt":
+        raise AppUpdateError("Замена текущего EXE поддерживается только на Windows")
+    executable = Path(current_executable or sys.executable).resolve()
+    if executable.suffix.lower() != ".exe":
+        raise AppUpdateError("Замена текущего EXE доступна только для .exe сборки")
+    if require_frozen and not getattr(sys, "frozen", False):
+        raise AppUpdateError("Замена текущего EXE недоступна при запуске из исходников")
+    downloaded = Path(downloaded_update).resolve()
+    if not downloaded.exists():
+        raise AppUpdateError("Скачанный файл обновления не найден")
+    if downloaded.suffix.lower() != ".exe":
+        raise AppUpdateError("Автоматическая замена поддерживает только .exe asset")
+    if downloaded == executable:
+        raise AppUpdateError("Файл обновления совпадает с текущим EXE")
+
+    updates_dir = updates_dir or (paths.ensure_app_dirs()["downloads"] / APP_UPDATES_DIR_NAME)
+    updates_dir.mkdir(parents=True, exist_ok=True)
+    install_path = executable.parent / _safe_filename(downloaded.name)
+    script_path = updates_dir / f"apply-update-{int(time.time())}.bat"
+    backup_path = executable.with_suffix(executable.suffix + ".old")
+    log_path = updates_dir / "apply-update.log"
+    script_path.write_text(
+        _build_in_place_update_script(
+            current_executable=executable,
+            downloaded_update=downloaded,
+            install_path=install_path,
+            backup_path=backup_path,
+            log_path=log_path,
+        ),
+        encoding="utf-8",
+        newline="\r\n",
+    )
+    return PreparedInPlaceUpdate(
+        downloaded_path=downloaded,
+        script_path=script_path,
+        current_executable=executable,
+        install_path=install_path,
+    )
+
+
+def launch_in_place_update(plan: PreparedInPlaceUpdate) -> None:
+    flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    try:
+        subprocess.Popen(
+            ["cmd.exe", "/c", str(plan.script_path)],
+            cwd=str(plan.script_path.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+            close_fds=True,
+        )
+    except OSError as exc:
+        raise AppUpdateError(f"Не удалось запустить замену приложения: {exc}") from exc
+
+
 def _version_key(version: str) -> tuple[tuple[int, ...], bool, tuple[str, ...]]:
     text = str(version or "").strip().lower()
     text = text.lstrip("v")
@@ -339,6 +420,70 @@ def _extract_sha256(text: str, target_name: str) -> str | None:
 def _safe_filename(name: str) -> str:
     cleaned = FILENAME_SAFE_RE.sub("_", str(name or "").strip()).strip(" .")
     return cleaned or "razreshenie-update.bin"
+
+
+def _batch_value(value: Path) -> str:
+    return str(value).replace("%", "%%")
+
+
+def _build_in_place_update_script(
+    *,
+    current_executable: Path,
+    downloaded_update: Path,
+    install_path: Path,
+    backup_path: Path,
+    log_path: Path,
+) -> str:
+    old_value = _batch_value(current_executable)
+    new_value = _batch_value(downloaded_update)
+    install_value = _batch_value(install_path)
+    backup_value = _batch_value(backup_path)
+    log_value = _batch_value(log_path)
+    return f"""@echo off
+setlocal
+set "OLD={old_value}"
+set "NEW={new_value}"
+set "INSTALL={install_value}"
+set "BACKUP={backup_value}"
+set "LOG={log_value}"
+echo [%date% %time%] Applying Razreshenie VPN Client update>"%LOG%"
+ping -n 3 127.0.0.1 >nul
+if /I "%INSTALL%"=="%OLD%" goto same_path
+if exist "%INSTALL%" del /f /q "%INSTALL%" >>"%LOG%" 2>&1
+move /y "%NEW%" "%INSTALL%" >>"%LOG%" 2>&1
+if errorlevel 1 goto launch_old
+for /l %%i in (1,1,60) do (
+    del /f /q "%OLD%" >>"%LOG%" 2>&1
+    if not exist "%OLD%" goto launch_new
+    ping -n 2 127.0.0.1 >nul
+)
+goto launch_new
+:same_path
+for /l %%i in (1,1,60) do (
+    move /y "%OLD%" "%BACKUP%" >>"%LOG%" 2>&1
+    if not exist "%OLD%" goto replace_same
+    ping -n 2 127.0.0.1 >nul
+)
+goto launch_old
+:replace_same
+move /y "%NEW%" "%OLD%" >>"%LOG%" 2>&1
+if errorlevel 1 goto restore_old
+del /f /q "%BACKUP%" >>"%LOG%" 2>&1
+start "" "%OLD%"
+goto cleanup
+:restore_old
+move /y "%BACKUP%" "%OLD%" >>"%LOG%" 2>&1
+goto launch_old
+:launch_new
+start "" "%INSTALL%"
+goto cleanup
+:launch_old
+if exist "%OLD%" start "" "%OLD%"
+goto cleanup
+:cleanup
+del /f /q "%~f0" >nul 2>&1
+exit /b 0
+"""
 
 
 def _safe_int(value: Any) -> int:

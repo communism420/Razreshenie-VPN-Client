@@ -34,6 +34,8 @@ from qfluentwidgets import (
 from core.connectivity import normalize_connectivity_timeout_ms, normalize_connectivity_urls
 from gui.widgets import _LineCard, _SpinCard
 from models.settings import (
+    APP_UPDATE_MODE_DOWNLOAD_ONLY,
+    APP_UPDATE_MODE_REPLACE_CURRENT,
     BACKGROUND_HEALTH_CHECK_MAX_FAILURE_THRESHOLD,
     BACKGROUND_HEALTH_CHECK_MAX_INTERVAL_SECONDS,
     BACKGROUND_HEALTH_CHECK_MIN_FAILURE_THRESHOLD,
@@ -48,9 +50,11 @@ from models.settings import (
     SELF_HEALING_MIN_COOLDOWN_SECONDS,
     SELF_HEALING_MIN_MAX_ATTEMPTS,
     AppSettings,
+    normalize_app_update_mode,
     normalize_dns_strategy,
 )
 from utils import paths
+
 
 class SettingsPage(QWidget):
     settings_changed = pyqtSignal()
@@ -132,6 +136,13 @@ class SettingsPage(QWidget):
         )
         self.auto_start_card = SwitchSettingCard(FIF.PLAY_SOLID, "Автозапуск Windows", "Запускать приложение вместе с Windows", parent=behavior_group)
         self.app_updates_card = SwitchSettingCard(FIF.UPDATE, "Обновления приложения", "Проверять GitHub Releases при запуске", parent=behavior_group)
+        self.update_mode_card = SettingCard(FIF.DOWNLOAD, "Способ обновления", "Как устанавливать новую версию приложения", behavior_group)
+        self.update_mode_combo = ComboBox(self.update_mode_card)
+        self.update_mode_combo.addItem("Скачать отдельно", userData=APP_UPDATE_MODE_DOWNLOAD_ONLY)
+        self.update_mode_combo.addItem("Заменить текущий EXE", userData=APP_UPDATE_MODE_REPLACE_CURRENT)
+        self.update_mode_combo.setMinimumWidth(230)
+        self.update_mode_card.hBoxLayout.addWidget(self.update_mode_combo, 0, Qt.AlignmentFlag.AlignRight)
+        self.update_mode_card.hBoxLayout.addSpacing(16)
         self.auto_update_card = SwitchSettingCard(FIF.SYNC, "Автообновление подписок", "Обновлять подписки по расписанию", parent=behavior_group)
         self.health_check_card = SwitchSettingCard(FIF.SYNC, "Health monitor", "Фоновая проверка текущего соединения", parent=behavior_group)
         self.health_interval_card = _SpinCard(
@@ -183,6 +194,7 @@ class SettingsPage(QWidget):
             self.smart_connect_card,
             self.auto_start_card,
             self.app_updates_card,
+            self.update_mode_card,
             self.auto_update_card,
             self.health_check_card,
             self.health_interval_card,
@@ -248,6 +260,7 @@ class SettingsPage(QWidget):
             self.smart_connect_card.setChecked(settings.smart_connect_enabled)
             self.auto_start_card.setChecked(settings.auto_start_windows)
             self.app_updates_card.setChecked(settings.auto_check_app_updates)
+            self._set_update_mode(settings.app_update_mode)
             self.auto_update_card.setChecked(settings.auto_update_subscriptions)
             self.health_check_card.setChecked(settings.background_health_check_enabled)
             self.health_interval_card.spin.setValue(settings.background_health_check_interval_seconds)
@@ -283,6 +296,7 @@ class SettingsPage(QWidget):
         settings.smart_connect_enabled = self.smart_connect_card.isChecked()
         settings.auto_start_windows = self.auto_start_card.isChecked()
         settings.auto_check_app_updates = self.app_updates_card.isChecked()
+        settings.app_update_mode = normalize_app_update_mode(self.update_mode_combo.currentData())
         settings.auto_update_subscriptions = self.auto_update_card.isChecked()
         settings.background_health_check_enabled = self.health_check_card.isChecked()
         settings.background_health_check_interval_seconds = int(self.health_interval_card.spin.value())
@@ -302,6 +316,14 @@ class SettingsPage(QWidget):
                 self.dns_strategy_combo.setCurrentIndex(index)
                 return
         self.dns_strategy_combo.setCurrentIndex(0)
+
+    def _set_update_mode(self, mode: str) -> None:
+        normalized = normalize_app_update_mode(mode)
+        for index in range(self.update_mode_combo.count()):
+            if self.update_mode_combo.itemData(index) == normalized:
+                self.update_mode_combo.setCurrentIndex(index)
+                return
+        self.update_mode_combo.setCurrentIndex(0)
 
     def _connect_auto_save_signals(self) -> None:
         for card in (
@@ -338,6 +360,7 @@ class SettingsPage(QWidget):
         ):
             card.edit.editingFinished.connect(self._emit_settings_changed)
         self.dns_strategy_combo.currentIndexChanged.connect(self._emit_settings_changed)
+        self.update_mode_combo.currentIndexChanged.connect(self._emit_settings_changed)
 
     def _emit_settings_changed(self, *_args) -> None:
         if not self._loading_values:

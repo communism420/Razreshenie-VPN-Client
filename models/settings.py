@@ -52,6 +52,12 @@ DNS_STRATEGIES = {
     DNS_STRATEGY_IPV4_ONLY,
     DNS_STRATEGY_IPV6_ONLY,
 }
+APP_UPDATE_MODE_DOWNLOAD_ONLY = "download_only"
+APP_UPDATE_MODE_REPLACE_CURRENT = "replace_current"
+APP_UPDATE_MODES = {
+    APP_UPDATE_MODE_DOWNLOAD_ONLY,
+    APP_UPDATE_MODE_REPLACE_CURRENT,
+}
 
 
 def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -95,6 +101,26 @@ def normalize_dns_strategy(value: Any, *, ipv6_enabled: bool = True) -> str:
     return strategy
 
 
+def normalize_app_update_mode(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "download": APP_UPDATE_MODE_DOWNLOAD_ONLY,
+        "download_only": APP_UPDATE_MODE_DOWNLOAD_ONLY,
+        "manual": APP_UPDATE_MODE_DOWNLOAD_ONLY,
+        "manual_install": APP_UPDATE_MODE_DOWNLOAD_ONLY,
+        "standalone": APP_UPDATE_MODE_DOWNLOAD_ONLY,
+        "скачать": APP_UPDATE_MODE_DOWNLOAD_ONLY,
+        "скачать_отдельно": APP_UPDATE_MODE_DOWNLOAD_ONLY,
+        "replace": APP_UPDATE_MODE_REPLACE_CURRENT,
+        "replace_current": APP_UPDATE_MODE_REPLACE_CURRENT,
+        "in_place": APP_UPDATE_MODE_REPLACE_CURRENT,
+        "install_in_place": APP_UPDATE_MODE_REPLACE_CURRENT,
+        "заменить": APP_UPDATE_MODE_REPLACE_CURRENT,
+        "заменить_текущий_exe": APP_UPDATE_MODE_REPLACE_CURRENT,
+    }
+    return aliases.get(text, text) if aliases.get(text, text) in APP_UPDATE_MODES else APP_UPDATE_MODE_DOWNLOAD_ONLY
+
+
 @dataclass(slots=True)
 class AppSettings:
     app_name: str = "Razreshenie VPN Client"
@@ -126,6 +152,7 @@ class AppSettings:
     auto_connect: bool = False
     auto_start_windows: bool = False
     auto_check_app_updates: bool = False
+    app_update_mode: str = APP_UPDATE_MODE_DOWNLOAD_ONLY
     auto_update_subscriptions: bool = True
     subscription_update_interval_hours: int = 24
     portable_mode: bool = False
@@ -174,6 +201,7 @@ class AppSettings:
         )
         safe["firewall_kill_switch"] = _optional_bool(safe.get("firewall_kill_switch"), False)
         safe["auto_check_app_updates"] = _optional_bool(safe.get("auto_check_app_updates"), False)
+        safe["app_update_mode"] = normalize_app_update_mode(safe.get("app_update_mode"))
         safe["smart_connect_enabled"] = _optional_bool(safe.get("smart_connect_enabled"), True)
         safe["enable_ipv6"] = _optional_bool(safe.get("enable_ipv6"), True)
         safe["tun_ipv6_address"] = str(safe.get("tun_ipv6_address") or DEFAULT_TUN_IPV6_ADDRESS).strip()

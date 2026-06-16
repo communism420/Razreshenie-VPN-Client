@@ -87,7 +87,15 @@ from gui.pages.settings import SettingsPage
 from gui.pages.subscriptions import SubscriptionsPage
 from gui.widgets import JsonEditorDialog
 from core import app_state
-from core.app_updater import AppUpdateInfo, check_for_app_update, download_update_asset
+from core.app_updater import (
+    AppUpdateInfo,
+    PreparedInPlaceUpdate,
+    check_for_app_update,
+    current_executable_can_be_replaced,
+    download_update_asset,
+    launch_in_place_update,
+    prepare_in_place_update,
+)
 from core.connection_service import ConnectionService, ConnectionStartResult
 from core.connectivity import ConnectivityCheckResult
 from core.diagnostics import build_diagnostics_archive
@@ -120,7 +128,9 @@ from models.rules import (
     normalize_outbound,
 )
 from models.settings import (
+    APP_UPDATE_MODE_REPLACE_CURRENT,
     AppSettings,
+    normalize_app_update_mode,
 )
 from utils import paths, windows
 from utils.app_logger import LogBuffer, setup_logger
@@ -2005,6 +2015,15 @@ class RazreshenieWindow(FluentWindow):
         if update.asset:
             size = f" · {format_bytes(update.asset.size)}" if update.asset.size else ""
             asset_line = f"{update.asset.name}{size}"
+        replace_mode = normalize_app_update_mode(self.settings.app_update_mode) == APP_UPDATE_MODE_REPLACE_CURRENT
+        can_replace = replace_mode and current_executable_can_be_replaced()
+        mode_text = (
+            "Приложение скачает новую версию, закроется и заменит текущий EXE в папке запуска."
+            if can_replace
+            else "Приложение скачает файл в локальную папку downloads/app-updates. Установка выполняется вручную."
+        )
+        if replace_mode and not can_replace:
+            mode_text += "\n\nРежим замены текущего EXE выбран, но сейчас клиент запущен не из собранного .exe."
 
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Information)
@@ -2014,12 +2033,12 @@ class RazreshenieWindow(FluentWindow):
             f"Установлена версия: {update.current_version}\n"
             f"Release: {update.release_name or update.latest_version}\n"
             f"Файл: {asset_line}\n\n"
-            "Приложение скачает файл в локальную папку downloads/app-updates. "
-            "Автоматическая замена запущенного exe не выполняется."
+            f"{mode_text}"
         )
         download_button = None
         if update.asset:
-            download_button = dialog.addButton("Скачать", QMessageBox.ButtonRole.AcceptRole)
+            label = "Скачать и заменить" if can_replace else "Скачать"
+            download_button = dialog.addButton(label, QMessageBox.ButtonRole.AcceptRole)
         release_button = dialog.addButton("Открыть release", QMessageBox.ButtonRole.ActionRole)
         dialog.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
         dialog.exec()
@@ -2037,20 +2056,68 @@ class RazreshenieWindow(FluentWindow):
             webbrowser.open(update.release_url)
             return
 
-        def worker() -> Path | BaseException:
+        replace_mode = (
+            normalize_app_update_mode(self.settings.app_update_mode) == APP_UPDATE_MODE_REPLACE_CURRENT
+            and current_executable_can_be_replaced()
+        )
+
+        def worker() -> Path | PreparedInPlaceUpdate | BaseException:
             try:
-                return download_update_asset(update)
+                path = download_update_asset(update)
             except Exception as exc:
                 return exc
+            if not replace_mode:
+                return path
+            try:
+                return prepare_in_place_update(path)
+            except Exception as exc:
+                self.logger.warning(
+                    "Подготовка замены приложения недоступна, файл оставлен как ручное обновление: %s",
+                    sanitize_error_text(exc),
+                )
+                return path
 
-        def done(result: Path | BaseException) -> None:
+        def done(result: Path | PreparedInPlaceUpdate | BaseException) -> None:
             if isinstance(result, BaseException):
                 self._handle_app_update_error(result, "Загрузка обновления", silent=False)
+                return
+            if isinstance(result, PreparedInPlaceUpdate):
+                self._prompt_in_place_update(result)
                 return
             self._show_status("success", f"Обновление скачано: {result.name}")
             self._prompt_downloaded_update(result)
 
         self._run_background(worker, done, busy="Скачивание обновления…")
+
+    def _prompt_in_place_update(self, plan: PreparedInPlaceUpdate) -> None:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Заменить текущий EXE?")
+        dialog.setText("Обновление готово к установке")
+        dialog.setInformativeText(
+            "Приложение остановит VPN, закроется и заменит текущий EXE новой версией.\n\n"
+            f"Новый файл: {plan.install_path}\n"
+            f"Текущий файл будет удалён: {plan.current_executable}"
+        )
+        install_button = dialog.addButton("Закрыть и заменить", QMessageBox.ButtonRole.AcceptRole)
+        folder_button = dialog.addButton("Открыть папку", QMessageBox.ButtonRole.ActionRole)
+        dialog.addButton("Позже", QMessageBox.ButtonRole.RejectRole)
+        dialog.exec()
+
+        clicked = dialog.clickedButton()
+        if clicked is folder_button:
+            windows.open_path(plan.downloaded_path.parent)
+            return
+        if clicked is not install_button:
+            self._show_status("info", f"Обновление скачано: {plan.downloaded_path.name}")
+            return
+        try:
+            launch_in_place_update(plan)
+        except Exception as exc:
+            self._handle_app_update_error(exc, "Запуск замены приложения", silent=False)
+            return
+        self._show_status("info", "Приложение закрывается для установки обновления…")
+        self.exit_app()
 
     def _prompt_downloaded_update(self, path: Path) -> None:
         is_installer = path.suffix.lower() in {".exe", ".msi"}
