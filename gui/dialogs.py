@@ -22,7 +22,17 @@ from dataclasses import dataclass
 from pathlib import PureWindowsPath
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QDialog, QGridLayout, QHBoxLayout, QListWidget, QListWidgetItem, QMessageBox, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QDialog,
+    QFileDialog,
+    QGridLayout,
+    QHBoxLayout,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QVBoxLayout,
+    QWidget,
+)
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
@@ -41,6 +51,7 @@ from models.rules import (
     clean_process_names,
     clean_process_path_regexes,
     clean_process_paths,
+    looks_like_process_executable_path,
     normalize_outbound,
 )
 from models.connection import (
@@ -306,10 +317,16 @@ class PerAppRuleDialog(QDialog):
         form.addWidget(BodyLabel("Активный процесс", self), 3, 0)
         form.addLayout(process_row, 3, 1)
 
+        value_row = QHBoxLayout()
+        value_row.setSpacing(8)
         self.value_edit = LineEdit(self)
         self.value_edit.setPlaceholderText("Telegram.exe")
+        self.browse_exe_btn = PushButton(FIF.FOLDER, "Выбрать .exe", self)
+        self.browse_exe_btn.setToolTip("Выбрать executable-файл приложения или вставить полный путь вручную")
+        value_row.addWidget(self.value_edit, 1)
+        value_row.addWidget(self.browse_exe_btn)
         form.addWidget(BodyLabel("Значение", self), 4, 0)
-        form.addWidget(self.value_edit, 4, 1)
+        form.addLayout(value_row, 4, 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -322,6 +339,8 @@ class PerAppRuleDialog(QDialog):
         self.cancel_btn.clicked.connect(self.reject)
         self.save_btn.clicked.connect(self._accept_if_valid)
         self.refresh_btn.clicked.connect(self._refresh_processes)
+        self.browse_exe_btn.clicked.connect(self._browse_executable_path)
+        self.value_edit.textChanged.connect(self._auto_select_process_path)
         self.process_combo.currentIndexChanged.connect(lambda _index: self._apply_selected_process())
         self.match_combo.currentIndexChanged.connect(lambda _index: self._on_match_kind_changed())
         self.route_combo.currentIndexChanged.connect(lambda _index: self._suggest_name_if_empty())
@@ -354,7 +373,7 @@ class PerAppRuleDialog(QDialog):
             return value
         return MATCH_KIND_PROCESS_NAME
 
-    def _on_match_kind_changed(self) -> None:
+    def _on_match_kind_changed(self, *, apply_selected_process: bool = True) -> None:
         kind = self._match_kind()
         if kind == MATCH_KIND_PROCESS_NAME:
             self.value_edit.setPlaceholderText("Telegram.exe")
@@ -362,7 +381,41 @@ class PerAppRuleDialog(QDialog):
             self.value_edit.setPlaceholderText(r"C:\Program Files\Telegram Desktop\Telegram.exe")
         else:
             self.value_edit.setPlaceholderText(r"(?i).*\\Telegram\.exe$")
-        self._apply_selected_process()
+        if apply_selected_process:
+            self._apply_selected_process()
+
+    def _set_match_kind(self, match_kind: str, *, apply_selected_process: bool) -> None:
+        for index in range(self.match_combo.count()):
+            if self.match_combo.itemData(index) == match_kind:
+                self.match_combo.blockSignals(True)
+                try:
+                    self.match_combo.setCurrentIndex(index)
+                finally:
+                    self.match_combo.blockSignals(False)
+                self._on_match_kind_changed(apply_selected_process=apply_selected_process)
+                return
+
+    def _auto_select_process_path(self, text: str) -> None:
+        if self._match_kind() != MATCH_KIND_PROCESS_NAME:
+            return
+        if looks_like_process_executable_path(text):
+            self._set_match_kind(MATCH_KIND_PROCESS_PATH, apply_selected_process=False)
+
+    def _browse_executable_path(self) -> None:
+        file_name, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Выбор приложения",
+            "",
+            "Приложения (*.exe);;Все файлы (*.*)",
+        )
+        if not file_name:
+            return
+        path = str(PureWindowsPath(file_name))
+        self._set_match_kind(MATCH_KIND_PROCESS_PATH, apply_selected_process=False)
+        self.value_edit.setText(path)
+        if not self.name_edit.text().strip():
+            route = "VPN" if normalize_outbound(str(self.route_combo.currentData())) == ROUTE_OUTBOUND_PROXY else "direct"
+            self.name_edit.setText(f"{PureWindowsPath(path).name}: {route}")
 
     def _apply_selected_process(self) -> None:
         process = self._selected_process()
@@ -395,6 +448,8 @@ class PerAppRuleDialog(QDialog):
     def _build_rule_data(self, *, show_errors: bool) -> PerAppRuleData | None:
         match_kind = self._match_kind()
         raw_value = self.value_edit.text().strip()
+        if match_kind == MATCH_KIND_PROCESS_NAME and looks_like_process_executable_path(raw_value):
+            match_kind = MATCH_KIND_PROCESS_PATH
         value = self._normalize_value(match_kind, raw_value, show_errors=show_errors)
         if not value:
             return None

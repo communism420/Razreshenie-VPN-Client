@@ -252,6 +252,14 @@ def _looks_like_windows_path(value: str) -> bool:
     )
 
 
+def looks_like_process_executable_path(value: Any) -> bool:
+    text = _clean_quoted_text(value)
+    if not text:
+        return False
+    text = _trim_windows_executable_arguments(_expand_windows_env_vars(text))
+    return bool(WINDOWS_EXE_RE.search(text)) and _looks_like_windows_path(text)
+
+
 def _unique_sorted_casefold(values: list[str]) -> list[str]:
     by_key: dict[str, str] = {}
     for value in values:
