@@ -151,6 +151,7 @@ class AppSettings:
     enable_system_proxy_guard: bool = False
     auto_connect: bool = False
     auto_start_windows: bool = False
+    always_run_as_admin: bool = False
     auto_check_app_updates: bool = False
     app_update_mode: str = APP_UPDATE_MODE_DOWNLOAD_ONLY
     auto_update_subscriptions: bool = True
@@ -200,6 +201,7 @@ class AppSettings:
             SELF_HEALING_MAX_COOLDOWN_SECONDS,
         )
         safe["firewall_kill_switch"] = _optional_bool(safe.get("firewall_kill_switch"), False)
+        safe["always_run_as_admin"] = _optional_bool(safe.get("always_run_as_admin"), False)
         safe["auto_check_app_updates"] = _optional_bool(safe.get("auto_check_app_updates"), False)
         safe["app_update_mode"] = normalize_app_update_mode(safe.get("app_update_mode"))
         safe["smart_connect_enabled"] = _optional_bool(safe.get("smart_connect_enabled"), True)

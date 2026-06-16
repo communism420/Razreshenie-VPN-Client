@@ -135,6 +135,12 @@ class SettingsPage(QWidget):
             parent=behavior_group,
         )
         self.auto_start_card = SwitchSettingCard(FIF.PLAY_SOLID, "Автозапуск Windows", "Запускать приложение вместе с Windows", parent=behavior_group)
+        self.always_admin_card = SwitchSettingCard(
+            FIF.CERTIFICATE,
+            "Всегда запускать от имени администратора",
+            "Запрашивать Windows UAC при каждом обычном запуске",
+            parent=behavior_group,
+        )
         self.app_updates_card = SwitchSettingCard(FIF.UPDATE, "Обновления приложения", "Проверять GitHub Releases при запуске", parent=behavior_group)
         self.update_mode_card = SettingCard(FIF.DOWNLOAD, "Способ обновления", "Как устанавливать новую версию приложения", behavior_group)
         self.update_mode_combo = ComboBox(self.update_mode_card)
@@ -193,6 +199,7 @@ class SettingsPage(QWidget):
             self.auto_connect_card,
             self.smart_connect_card,
             self.auto_start_card,
+            self.always_admin_card,
             self.app_updates_card,
             self.update_mode_card,
             self.auto_update_card,
@@ -259,6 +266,7 @@ class SettingsPage(QWidget):
             self.auto_connect_card.setChecked(settings.auto_connect)
             self.smart_connect_card.setChecked(settings.smart_connect_enabled)
             self.auto_start_card.setChecked(settings.auto_start_windows)
+            self.always_admin_card.setChecked(settings.always_run_as_admin)
             self.app_updates_card.setChecked(settings.auto_check_app_updates)
             self._set_update_mode(settings.app_update_mode)
             self.auto_update_card.setChecked(settings.auto_update_subscriptions)
@@ -295,6 +303,7 @@ class SettingsPage(QWidget):
         settings.auto_connect = self.auto_connect_card.isChecked()
         settings.smart_connect_enabled = self.smart_connect_card.isChecked()
         settings.auto_start_windows = self.auto_start_card.isChecked()
+        settings.always_run_as_admin = self.always_admin_card.isChecked()
         settings.auto_check_app_updates = self.app_updates_card.isChecked()
         settings.app_update_mode = normalize_app_update_mode(self.update_mode_combo.currentData())
         settings.auto_update_subscriptions = self.auto_update_card.isChecked()
@@ -334,6 +343,7 @@ class SettingsPage(QWidget):
             self.auto_connect_card,
             self.smart_connect_card,
             self.auto_start_card,
+            self.always_admin_card,
             self.app_updates_card,
             self.auto_update_card,
             self.health_check_card,

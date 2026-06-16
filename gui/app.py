@@ -1917,9 +1917,23 @@ class RazreshenieWindow(FluentWindow):
         before_runtime = self._settings_runtime_key(self.settings)
         before_firewall_kill_switch = bool(self.settings.firewall_kill_switch)
         before_auto_start = bool(self.settings.auto_start_windows)
+        before_always_admin = bool(self.settings.always_run_as_admin)
         try:
             next_settings = self.settings_page.apply_to_settings(AppSettings.from_dict(self.settings.to_dict()))
             if next_settings.to_dict() == self.settings.to_dict():
+                return
+            always_admin_turning_on = bool(next_settings.always_run_as_admin) and not before_always_admin
+            if always_admin_turning_on and windows.is_windows() and not windows.is_admin():
+                self._show_status(
+                    "info",
+                    "Постоянный запуск от имени администратора включен. Сейчас откроется запрос Windows UAC.",
+                )
+                if windows.relaunch_as_admin():
+                    app_state.save_settings(next_settings)
+                    QTimer.singleShot(250, self.exit_app)
+                    return
+                self._show_status("error", "Windows не выдала права администратора или запрос был отменен")
+                self.settings_page.set_values(self.settings)
                 return
             firewall_turning_on = bool(next_settings.firewall_kill_switch) and not before_firewall_kill_switch
             if firewall_turning_on and windows.is_windows() and not windows.is_admin():

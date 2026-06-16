@@ -26,7 +26,7 @@ python main.py --self-check
 python -m pip install -r requirements.txt
 python tools\create_icon.py
 pyinstaller --noconfirm --clean --onefile --windowed `
-  --name "Razreshenie VPN Client 3.2.1" `
+  --name "Razreshenie VPN Client 3.3.0" `
   --icon assets\app.ico `
   --version-file tools\windows_version_info.txt `
   --collect-data qfluentwidgets `
@@ -44,8 +44,8 @@ pyinstaller --noconfirm --clean --onefile --windowed `
 Для updater желательно приложить:
 
 ```text
-Razreshenie VPN Client 3.2.1.exe
-Razreshenie VPN Client 3.2.1.exe.sha256
+Razreshenie VPN Client 3.3.0.exe
+Razreshenie VPN Client 3.3.0.exe.sha256
 ```
 
 Checksum asset опционален, но если он есть, клиент сверит SHA256 скачанного файла.

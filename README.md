@@ -2,7 +2,7 @@
 
 **Razreshenie VPN Client** - открытый Windows VPN-клиент на Python, PyQt6 и sing-box.
 
-**Версия:** `3.2.1`
+**Версия:** `3.3.0`
 
 Слоган: **«Разреши себе доступ к любым сайтам»**.
 
@@ -43,6 +43,7 @@
 - Kill Switch для TUN и отдельный opt-in Firewall Kill Switch Windows.
 - Диагностика ZIP с redaction секретов.
 - Проверка обновлений приложения через GitHub Releases с режимом ручного скачивания или замены текущего EXE.
+- Опциональный постоянный запуск от имени администратора с UAC при каждом обычном старте.
 - Автосохранение настроек без отдельной кнопки сохранения.
 
 ## Быстрый запуск из исходников
@@ -55,7 +56,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Proxy-режим работает без прав администратора. TUN-режим запросит UAC при подключении, если у процесса нет прав администратора.
+Proxy-режим работает без прав администратора. TUN-режим запросит UAC при подключении, если у процесса нет прав администратора. В настройках можно включить постоянный UAC-запуск приложения.
 
 ## Проверка
 
@@ -73,7 +74,7 @@ python main.py --self-check
 
 ```powershell
 pyinstaller --noconfirm --clean --onefile --windowed `
-  --name "Razreshenie VPN Client 3.2.1" `
+  --name "Razreshenie VPN Client 3.3.0" `
   --icon assets\app.ico `
   --version-file tools\windows_version_info.txt `
   --collect-data qfluentwidgets `

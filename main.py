@@ -46,6 +46,23 @@ def run_gui() -> int:
     return 0
 
 
+def maybe_relaunch_as_admin_for_startup() -> bool:
+    """Перезапускает приложение с UAC, если пользователь включил постоянный admin-запуск."""
+    from core import app_state
+    from utils import windows
+
+    if not windows.is_windows() or windows.is_admin():
+        return False
+    try:
+        settings = app_state.load_settings()
+    except Exception as exc:
+        print(f"Не удалось прочитать настройки запуска от администратора: {exc}", file=sys.stderr)
+        return False
+    if not settings.always_run_as_admin:
+        return False
+    return windows.relaunch_as_admin()
+
+
 def run_self_check() -> int:
     """Минимальная проверка основных модулей без запуска GUI."""
     from core.connectivity import (
@@ -233,6 +250,7 @@ def run_self_check() -> int:
     assert AppSettings.from_dict({"auto_check_app_updates": "no"}).auto_check_app_updates is False
     assert AppSettings.from_dict({"app_update_mode": "replace"}).app_update_mode == "replace_current"
     assert AppSettings.from_dict({"app_update_mode": "unknown"}).app_update_mode == "download_only"
+    assert AppSettings.from_dict({"always_run_as_admin": "yes"}).always_run_as_admin is True
     assert AppSettings().smart_connect_enabled is True
     assert AppSettings.from_dict({"smart_connect_enabled": "off"}).smart_connect_enabled is False
     assert app_release_api_url("https://github.com/communism420/Razreshenie-VPN-Client").endswith(
@@ -957,6 +975,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.self_check:
         return run_self_check()
+    if maybe_relaunch_as_admin_for_startup():
+        return 0
     return run_gui()
 
 
