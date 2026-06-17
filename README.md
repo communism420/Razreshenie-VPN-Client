@@ -2,7 +2,7 @@
 
 **Razreshenie VPN Client** - открытый Windows VPN-клиент на Python, PyQt6 и sing-box.
 
-**Версия:** `3.3.1`
+**Версия:** `4.0.0`
 
 Слоган: **«Разреши себе доступ к любым сайтам»**.
 
@@ -14,6 +14,7 @@
 
 Подробные инструкции находятся в папке [docs](docs/README.md):
 
+- [История изменений](CHANGELOG.md) - подробные release notes версии 4.0.0.
 - [Первый запуск](docs/GETTING_STARTED.md) - установка, мастер первого запуска, импорт первого сервера и выбор Proxy/TUN.
 - [Smart Connect](docs/SMART_CONNECT.md) - автоматический выбор лучшего сервера и история качества.
 - [Failover](docs/FAILOVER.md) - группы серверов, health monitor и self-healing.
@@ -68,13 +69,19 @@ python main.py --self-check
 
 `--self-check` проверяет парсеры серверов, генерацию sing-box config, маршрутизацию, Smart Connect, диагностику, updater-логику и обработку ошибок без запуска GUI.
 
+Перед релизной сборкой дополнительно используйте:
+
+```powershell
+python tools\release_check.py
+```
+
 ## Сборка EXE
 
 Краткая команда:
 
 ```powershell
 pyinstaller --noconfirm --clean --onefile --windowed `
-  --name "Razreshenie VPN Client 3.3.1" `
+  --name "Razreshenie VPN Client 4.0.0" `
   --icon assets\app.ico `
   --version-file tools\windows_version_info.txt `
   --collect-data qfluentwidgets `
@@ -85,7 +92,7 @@ pyinstaller --noconfirm --clean --onefile --windowed `
   main.py
 ```
 
-Полный release checklist: [docs/BUILD_RELEASE.md](docs/BUILD_RELEASE.md).
+Полный release checklist: [docs/BUILD_RELEASE.md](docs/BUILD_RELEASE.md). Подробные изменения 4.0.0: [CHANGELOG.md](CHANGELOG.md).
 
 ## Атрибуция
 

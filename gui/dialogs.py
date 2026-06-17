@@ -23,6 +23,7 @@ from pathlib import PureWindowsPath
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QDialog,
     QFileDialog,
     QGridLayout,
@@ -45,6 +46,7 @@ from qfluentwidgets import (
     SwitchButton,
 )
 
+from gui.common import protocol_label
 from models.rules import (
     ROUTE_OUTBOUND_DIRECT,
     ROUTE_OUTBOUND_PROXY,
@@ -219,7 +221,8 @@ class OnboardingDialog(QDialog):
 
         note = CaptionLabel(
             "Proxy подходит для быстрого старта без администратора. TUN нужен для системного туннеля, "
-            "split tunneling и Kill Switch; при подключении он может запросить UAC.",
+            "split tunneling и Kill Switch; при подключении он может запросить UAC. "
+            "Фоновая проверка помогает Failover и self-healing быстрее восстановить соединение после сбоев.",
             self,
         )
         note.setWordWrap(True)
@@ -502,7 +505,7 @@ class SmartGroupEditorDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Группа серверов")
-        self.resize(780, 560)
+        self.resize(860, 650)
         self._group = group
         self._profiles = list(profiles)
         self._profile_by_id = {profile.id: profile for profile in self._profiles}
@@ -512,12 +515,9 @@ class SmartGroupEditorDialog(QDialog):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(12)
         layout.addWidget(SubtitleLabel("Группа серверов", self))
-        hint = CaptionLabel(
-            "Порядок списка используется как приоритет. В Multi-hop первый сервер является первым hop, последний - exit.",
-            self,
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        self.mode_hint = CaptionLabel("", self)
+        self.mode_hint.setWordWrap(True)
+        layout.addWidget(self.mode_hint)
 
         form = QGridLayout()
         form.setHorizontalSpacing(14)
@@ -539,6 +539,7 @@ class SmartGroupEditorDialog(QDialog):
         self.mode_combo.addItem("Multi-hop", userData=SMART_GROUP_MODE_MULTI_HOP)
         self.mode_combo.addItem("Load Balance", userData=SMART_GROUP_MODE_LOAD_BALANCE)
         self._set_combo_data(self.mode_combo, normalize_smart_group_mode(group.mode))
+        self.mode_combo.setToolTip("Failover запускает один сервер, Multi-hop строит цепочку, Load Balance собирает urltest-группу.")
         form.addWidget(BodyLabel("Режим", self), 2, 0)
         form.addWidget(self.mode_combo, 2, 1)
 
@@ -547,39 +548,68 @@ class SmartGroupEditorDialog(QDialog):
         self.strategy_combo.addItem("Минимальный пинг", userData=SMART_STRATEGY_LATENCY)
         self.strategy_combo.addItem("По порядку", userData=SMART_STRATEGY_FAILOVER_ORDER)
         self._set_combo_data(self.strategy_combo, normalize_smart_strategy(group.strategy))
+        self.strategy_combo.setToolTip("Стратегия используется для Failover. Для Multi-hop важен ручной порядок, для Load Balance - urltest.")
         form.addWidget(BodyLabel("Стратегия", self), 3, 0)
         form.addWidget(self.strategy_combo, 3, 1)
 
         self.interval_edit = LineEdit(self)
         self.interval_edit.setText(group.load_balance_interval or SMART_GROUP_LOAD_BALANCE_INTERVAL_DEFAULT)
-        form.addWidget(BodyLabel("LB interval", self), 4, 0)
+        self.interval_edit.setPlaceholderText(SMART_GROUP_LOAD_BALANCE_INTERVAL_DEFAULT)
+        self.interval_edit.setToolTip("Период проверки urltest внутри Load Balance, например 30s или 1m.")
+        form.addWidget(BodyLabel("LB интервал", self), 4, 0)
         form.addWidget(self.interval_edit, 4, 1)
 
         self.tolerance_edit = LineEdit(self)
         self.tolerance_edit.setText(str(group.load_balance_tolerance_ms or SMART_GROUP_LOAD_BALANCE_TOLERANCE_DEFAULT_MS))
-        form.addWidget(BodyLabel("LB tolerance, ms", self), 5, 0)
+        self.tolerance_edit.setPlaceholderText(str(SMART_GROUP_LOAD_BALANCE_TOLERANCE_DEFAULT_MS))
+        self.tolerance_edit.setToolTip("Допустимая разница latency для urltest, мс.")
+        form.addWidget(BodyLabel("LB tolerance, мс", self), 5, 0)
         form.addWidget(self.tolerance_edit, 5, 1)
 
         add_row = QHBoxLayout()
         add_row.setSpacing(8)
         self.profile_combo = ComboBox(self)
         self.profile_combo.setMinimumWidth(500)
+        self.profile_combo.setToolTip("Добавьте серверы в группу. Дубликаты не добавляются.")
         self.add_btn = PushButton(FIF.ADD, "Добавить", self)
+        self.add_btn.setToolTip("Добавить выбранный сервер в конец группы")
         add_row.addWidget(self.profile_combo, 1)
         add_row.addWidget(self.add_btn)
         layout.addLayout(add_row)
 
+        members_header = QHBoxLayout()
+        members_header.setSpacing(8)
+        members_header.addWidget(BodyLabel("Участники и порядок", self))
+        self.member_count_label = CaptionLabel("0 серверов", self)
+        members_header.addWidget(self.member_count_label)
+        members_header.addStretch(1)
+        layout.addLayout(members_header)
+
         self.members_list = QListWidget(self)
-        self.members_list.setMinimumHeight(170)
+        self.members_list.setMinimumHeight(230)
+        self.members_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.members_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.members_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.members_list.setAlternatingRowColors(True)
+        self.members_list.setToolTip("Перетащите серверы мышью или используйте кнопки порядка ниже.")
         layout.addWidget(self.members_list, 1)
 
         member_actions = QHBoxLayout()
         member_actions.setSpacing(8)
+        self.top_btn = PushButton(FIF.UP, "В начало", self)
         self.up_btn = PushButton(FIF.UP, "Выше", self)
         self.down_btn = PushButton(FIF.DOWN, "Ниже", self)
+        self.bottom_btn = PushButton(FIF.DOWN, "В конец", self)
         self.remove_btn = PushButton(FIF.DELETE, "Удалить", self)
+        self.top_btn.setToolTip("Сделать выбранный сервер первым в порядке группы")
+        self.up_btn.setToolTip("Поднять выбранный сервер на одну позицию")
+        self.down_btn.setToolTip("Опустить выбранный сервер на одну позицию")
+        self.bottom_btn.setToolTip("Переместить выбранный сервер в конец порядка группы")
+        self.remove_btn.setToolTip("Удалить выбранный сервер из группы")
+        member_actions.addWidget(self.top_btn)
         member_actions.addWidget(self.up_btn)
         member_actions.addWidget(self.down_btn)
+        member_actions.addWidget(self.bottom_btn)
         member_actions.addWidget(self.remove_btn)
         member_actions.addStretch(1)
         layout.addLayout(member_actions)
@@ -593,10 +623,14 @@ class SmartGroupEditorDialog(QDialog):
         layout.addLayout(buttons)
 
         self.add_btn.clicked.connect(self._add_selected_profile)
+        self.top_btn.clicked.connect(lambda: self._move_member_to_edge(to_top=True))
         self.up_btn.clicked.connect(lambda: self._move_member(-1))
         self.down_btn.clicked.connect(lambda: self._move_member(1))
+        self.bottom_btn.clicked.connect(lambda: self._move_member_to_edge(to_top=False))
         self.remove_btn.clicked.connect(self._remove_selected_member)
         self.mode_combo.currentIndexChanged.connect(lambda _index: self._sync_mode_controls())
+        self.members_list.itemSelectionChanged.connect(self._sync_member_actions)
+        self.members_list.model().rowsMoved.connect(lambda *_args: self._refresh_member_labels())
         self.cancel_btn.clicked.connect(self.reject)
         self.save_btn.clicked.connect(self._accept_if_valid)
 
@@ -613,12 +647,14 @@ class SmartGroupEditorDialog(QDialog):
     def _reload_profiles_combo(self) -> None:
         self.profile_combo.clear()
         for profile in self._profiles:
-            self.profile_combo.addItem(self._profile_label(profile), userData=profile.id)
+            self.profile_combo.addItem(self._profile_combo_label(profile), userData=profile.id)
 
     def _append_member(self, profile: VlessProfile) -> None:
-        item = QListWidgetItem(self._profile_label(profile))
+        item = QListWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, profile.id)
+        item.setToolTip(self._profile_tooltip(profile))
         self.members_list.addItem(item)
+        self._refresh_member_labels()
 
     def _add_selected_profile(self) -> None:
         profile_id = str(self.profile_combo.currentData() or "")
@@ -629,6 +665,7 @@ class SmartGroupEditorDialog(QDialog):
             return
         self._append_member(profile)
         self.members_list.setCurrentRow(self.members_list.count() - 1)
+        self._sync_member_actions()
 
     def _move_member(self, direction: int) -> None:
         row = self.members_list.currentRow()
@@ -638,11 +675,25 @@ class SmartGroupEditorDialog(QDialog):
         item = self.members_list.takeItem(row)
         self.members_list.insertItem(target, item)
         self.members_list.setCurrentRow(target)
+        self._refresh_member_labels()
+
+    def _move_member_to_edge(self, *, to_top: bool) -> None:
+        row = self.members_list.currentRow()
+        if row < 0:
+            return
+        target = 0 if to_top else self.members_list.count() - 1
+        if row == target:
+            return
+        item = self.members_list.takeItem(row)
+        self.members_list.insertItem(target, item)
+        self.members_list.setCurrentRow(target)
+        self._refresh_member_labels()
 
     def _remove_selected_member(self) -> None:
         row = self.members_list.currentRow()
         if row >= 0:
             self.members_list.takeItem(row)
+            self._refresh_member_labels()
 
     def _member_ids(self) -> list[str]:
         result: list[str] = []
@@ -659,6 +710,37 @@ class SmartGroupEditorDialog(QDialog):
         self.interval_edit.setEnabled(load_balance)
         self.tolerance_edit.setEnabled(load_balance)
         self.strategy_combo.setEnabled(mode == SMART_GROUP_MODE_FAILOVER)
+        self.mode_hint.setText(self._mode_hint(mode))
+        self._refresh_member_labels()
+        self._sync_member_actions()
+
+    def _sync_member_actions(self) -> None:
+        row = self.members_list.currentRow()
+        count = self.members_list.count()
+        has_selection = row >= 0
+        self.top_btn.setEnabled(has_selection and row > 0)
+        self.up_btn.setEnabled(has_selection and row > 0)
+        self.down_btn.setEnabled(has_selection and row < count - 1)
+        self.bottom_btn.setEnabled(has_selection and row < count - 1)
+        self.remove_btn.setEnabled(has_selection)
+        mode = normalize_smart_group_mode(str(self.mode_combo.currentData() or ""))
+        minimum = 2 if mode in {SMART_GROUP_MODE_MULTI_HOP, SMART_GROUP_MODE_LOAD_BALANCE} else 1
+        suffix = f" · минимум {minimum}" if count < minimum else ""
+        self.member_count_label.setText(f"{count} серверов{suffix}")
+
+    def _refresh_member_labels(self) -> None:
+        mode = normalize_smart_group_mode(str(self.mode_combo.currentData() or ""))
+        count = self.members_list.count()
+        for index in range(count):
+            item = self.members_list.item(index)
+            profile_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            profile = self._profile_by_id.get(profile_id)
+            if not profile:
+                item.setText(f"{index + 1:02d}. Сервер не найден")
+                continue
+            item.setText(self._member_label(profile, index, count, mode))
+            item.setToolTip(self._member_tooltip(profile, index, count, mode))
+        self._sync_member_actions()
 
     def _build_data(self, *, show_errors: bool) -> SmartGroupEditorData | None:
         name = self.name_edit.text().strip() or "Smart Group"
@@ -697,8 +779,71 @@ class SmartGroupEditorDialog(QDialog):
             QMessageBox.warning(self, "Некорректная группа", message)
 
     @staticmethod
-    def _profile_label(profile: VlessProfile) -> str:
-        return f"{profile.name} [{profile.protocol}] ({profile.address}:{profile.port})"
+    def _profile_combo_label(profile: VlessProfile) -> str:
+        latency = f" · {profile.latency_ms} ms" if profile.latency_ms is not None else ""
+        group = f" · {profile.group}" if profile.group else ""
+        return f"{profile.name} · {protocol_label(profile)} · {profile.address}:{profile.port}{latency}{group}"
+
+    @staticmethod
+    def _profile_tooltip(profile: VlessProfile) -> str:
+        lines = [
+            profile.name,
+            f"{profile.address}:{profile.port}",
+            f"Тип: {protocol_label(profile)}",
+        ]
+        if profile.latency_ms is not None:
+            lines.append(f"Пинг: {profile.latency_ms} ms")
+        if profile.group:
+            lines.append(f"Группа: {profile.group}")
+        if profile.tags:
+            lines.append(f"Теги: {', '.join(profile.tags[:8])}")
+        return "\n".join(lines)
+
+    @classmethod
+    def _member_label(cls, profile: VlessProfile, index: int, count: int, mode: str) -> str:
+        role = cls._member_role(index, count, mode)
+        latency = f"{profile.latency_ms} ms" if profile.latency_ms is not None else "пинг —"
+        return f"{index + 1:02d}. {role} · {profile.name} · {protocol_label(profile)} · {latency}"
+
+    @classmethod
+    def _member_tooltip(cls, profile: VlessProfile, index: int, count: int, mode: str) -> str:
+        return "\n".join(
+            [
+                cls._member_role(index, count, mode),
+                cls._profile_tooltip(profile),
+            ]
+        )
+
+    @staticmethod
+    def _member_role(index: int, count: int, mode: str) -> str:
+        if mode == SMART_GROUP_MODE_MULTI_HOP:
+            if count <= 1:
+                return "Hop 1"
+            if index == 0:
+                return "Hop 1 / вход"
+            if index == count - 1:
+                return "Exit hop"
+            return f"Hop {index + 1}"
+        if mode == SMART_GROUP_MODE_LOAD_BALANCE:
+            return f"LB member {index + 1}"
+        return f"Приоритет {index + 1}"
+
+    @staticmethod
+    def _mode_hint(mode: str) -> str:
+        if mode == SMART_GROUP_MODE_MULTI_HOP:
+            return (
+                "Multi-hop: порядок критичен. Первый сервер принимает локальное подключение, "
+                "последний является exit. Если любой hop недоступен, цепочка не стартует."
+            )
+        if mode == SMART_GROUP_MODE_LOAD_BALANCE:
+            return (
+                "Load Balance: sing-box urltest выбирает рабочий быстрый outbound внутри группы. "
+                "Порядок используется как стабильная база, а interval/tolerance управляют проверкой."
+            )
+        return (
+            "Failover: порядок списка задаёт приоритет для стратегии 'По порядку'. "
+            "Для умного выбора дополнительно учитываются пинг, история ошибок и cooldown."
+        )
 
     @staticmethod
     def _set_combo_data(combo: ComboBox, value: str) -> None:

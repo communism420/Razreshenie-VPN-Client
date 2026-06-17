@@ -22,6 +22,7 @@ class OutboundBuilderTests(unittest.TestCase):
         self.builder = OutboundBuilder()
 
     def test_trojan_reality_outbound(self) -> None:
+        public_key = "A" * 43
         outbound = self.builder.build(
             server(
                 "trojan",
@@ -30,7 +31,7 @@ class OutboundBuilderTests(unittest.TestCase):
                     "security": "reality",
                     "sni": "front.example",
                     "fp": "chrome",
-                    "pbk": "public-key",
+                    "pbk": public_key,
                     "sid": "abcd",
                 },
             )
@@ -40,8 +41,26 @@ class OutboundBuilderTests(unittest.TestCase):
         self.assertEqual(outbound["password"], "secret")
         self.assertEqual(outbound["tls"]["server_name"], "front.example")
         self.assertEqual(outbound["tls"]["utls"]["fingerprint"], "chrome")
-        self.assertEqual(outbound["tls"]["reality"]["public_key"], "public-key")
+        self.assertEqual(outbound["tls"]["reality"]["public_key"], public_key)
         self.assertEqual(outbound["tls"]["reality"]["short_id"], "abcd")
+
+    def test_reality_rejects_obviously_invalid_public_key(self) -> None:
+        with self.assertRaisesRegex(OutboundBuildError, "pbk/publicKey"):
+            self.builder.build(
+                server(
+                    "trojan",
+                    params={"password": "secret", "security": "reality", "pbk": "bad key"},
+                )
+            )
+
+    def test_reality_rejects_invalid_short_id(self) -> None:
+        with self.assertRaisesRegex(OutboundBuildError, "sid/short_id"):
+            self.builder.build(
+                server(
+                    "trojan",
+                    params={"password": "secret", "security": "reality", "pbk": "A" * 43, "sid": "xyz"},
+                )
+            )
 
     def test_vmess_rejects_reality(self) -> None:
         with self.assertRaises(OutboundBuildError):

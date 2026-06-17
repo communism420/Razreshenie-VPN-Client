@@ -197,6 +197,9 @@ class ServersPage(QWidget):
         self.create_failover_btn = PushButton(FIF.LINK, "Создать для выбранного", self.smart_card)
         self.start_group_btn = PushButton(FIF.PLAY_SOLID, "Запустить группу", self.smart_card)
         self.edit_group_btn = PushButton(FIF.EDIT, "Редактировать", self.smart_card)
+        self.create_failover_btn.setToolTip("Создать или обновить группу вокруг выбранного сервера")
+        self.start_group_btn.setToolTip("Запустить выбранную группу: Failover, Multi-hop или Load Balance")
+        self.edit_group_btn.setToolTip("Открыть редактор состава, режима и порядка серверов")
         smart_header.addWidget(smart_title)
         smart_header.addSpacing(8)
         smart_header.addWidget(self.smart_status_label)
@@ -208,8 +211,10 @@ class ServersPage(QWidget):
         smart_layout.addLayout(smart_header)
 
         self.smart_groups_table = TableWidget(self.smart_card)
-        self.smart_groups_table.setColumnCount(6)
-        self.smart_groups_table.setHorizontalHeaderLabels(["Группа", "Режим", "Стратегия", "Серверов", "Статус", "Обновлена"])
+        self.smart_groups_table.setColumnCount(8)
+        self.smart_groups_table.setHorizontalHeaderLabels(
+            ["Группа", "Режим", "Стратегия", "Серверов", "Качество", "Использование", "Статус", "Обновлена"]
+        )
         self.smart_groups_table.verticalHeader().setVisible(False)
         self.smart_groups_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.smart_groups_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -220,10 +225,15 @@ class ServersPage(QWidget):
         self.smart_groups_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.smart_groups_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.smart_groups_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.smart_groups_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.smart_groups_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         self.smart_groups_table.verticalHeader().setDefaultSectionSize(30)
-        self.smart_groups_table.setMaximumHeight(148)
+        self.smart_groups_table.setMaximumHeight(184)
         polish_table(self.smart_groups_table, row_height=30)
         smart_layout.addWidget(self.smart_groups_table)
+        self.smart_group_detail_label = CaptionLabel("Выберите группу, чтобы увидеть состав и статистику.", self.smart_card)
+        self.smart_group_detail_label.setWordWrap(True)
+        smart_layout.addWidget(self.smart_group_detail_label)
         root.addWidget(self.smart_card)
 
         self.table = TableWidget(self)
@@ -250,7 +260,7 @@ class ServersPage(QWidget):
         apply_card_layout(quality_layout)
         quality_header = QHBoxLayout()
         quality_header.setSpacing(10)
-        self.quality_title = StrongBodyLabel("История качества", self.quality_card)
+        self.quality_title = StrongBodyLabel("Долгосрочная статистика", self.quality_card)
         self.quality_server_label = BodyLabel("Сервер не выбран", self.quality_card)
         quality_header.addWidget(self.quality_title)
         quality_header.addSpacing(8)
@@ -259,8 +269,8 @@ class ServersPage(QWidget):
 
         quality_metrics = QHBoxLayout()
         quality_metrics.setSpacing(12)
-        self.quality_success_label = CaptionLabel("Success: —", self.quality_card)
-        self.quality_latency_label = CaptionLabel("Latency: —", self.quality_card)
+        self.quality_success_label = CaptionLabel("Успешность: —", self.quality_card)
+        self.quality_latency_label = CaptionLabel("Задержка: —", self.quality_card)
         self.quality_failures_label = CaptionLabel("Ошибки: —", self.quality_card)
         self.quality_checked_label = CaptionLabel("Проверка: —", self.quality_card)
         self.quality_usage_label = CaptionLabel("Использование: —", self.quality_card)
@@ -309,6 +319,7 @@ class ServersPage(QWidget):
         self.create_failover_btn.clicked.connect(lambda: self._emit_for_selected(self.failover_group_requested))
         self.start_group_btn.clicked.connect(lambda: self._emit_for_selected_group(self.smart_group_start_requested))
         self.edit_group_btn.clicked.connect(lambda: self._emit_for_selected_group(self.smart_group_edit_requested))
+        self.smart_groups_table.itemSelectionChanged.connect(self._refresh_smart_group_details)
         self.validate_btn.clicked.connect(self.validate_requested)
 
     def set_profiles(
@@ -348,9 +359,9 @@ class ServersPage(QWidget):
         stats = self._quality_stats.get(profile.id)
         self.quality_server_label.setText(f"{profile.name} · {profile.address}:{profile.port}")
         if not stats:
-            self.quality_success_label.setText("Success: —")
+            self.quality_success_label.setText("Успешность: —")
             style_badge_label(self.quality_success_label, "muted")
-            self.quality_latency_label.setText("Latency: —")
+            self.quality_latency_label.setText("Задержка: —")
             self.quality_failures_label.setText("Ошибки: —")
             self.quality_checked_label.setText("Проверка: —")
             self.quality_usage_label.setText("Использование: —")
@@ -359,7 +370,7 @@ class ServersPage(QWidget):
 
         success_percent = int(stats.success_rate * 100)
         recent_percent = int(stats.recent_success_rate * 100)
-        self.quality_success_label.setText(f"Success: {success_percent}% · recent {recent_percent}%")
+        self.quality_success_label.setText(f"Успешность: {success_percent}% · недавно {recent_percent}%")
         if stats.consecutive_failures >= 2 or recent_percent < SERVER_QUALITY_OK_PERCENT:
             style_badge_label(self.quality_success_label, "danger")
         elif recent_percent < SERVER_QUALITY_GOOD_PERCENT:
@@ -368,9 +379,9 @@ class ServersPage(QWidget):
             style_badge_label(self.quality_success_label, "success")
 
         self.quality_latency_label.setText(
-            "Latency: "
-            f"last {self._latency_value_label(stats.last_latency_ms)} · "
-            f"avg {self._latency_value_label(stats.recent_average_latency_ms)} · "
+            "Задержка: "
+            f"последняя {self._latency_value_label(stats.last_latency_ms)} · "
+            f"средняя {self._latency_value_label(stats.recent_average_latency_ms)} · "
             f"ewma {self._latency_value_label(int(stats.latency_ewma_ms) if stats.latency_ewma_ms is not None else None)}"
         )
         cooldown = f" · cooldown до {self._short_timestamp(stats.cooldown_until)}" if stats.cooldown_until else ""
@@ -393,9 +404,9 @@ class ServersPage(QWidget):
 
     def _set_empty_quality_panel(self, message: str) -> None:
         self.quality_server_label.setText(message)
-        self.quality_success_label.setText("Success: —")
+        self.quality_success_label.setText("Успешность: —")
         style_badge_label(self.quality_success_label, "muted")
-        self.quality_latency_label.setText("Latency: —")
+        self.quality_latency_label.setText("Задержка: —")
         self.quality_failures_label.setText("Ошибки: —")
         self.quality_checked_label.setText("Проверка: —")
         self.quality_usage_label.setText("Использование: —")
@@ -458,6 +469,7 @@ class ServersPage(QWidget):
         self.smart_groups_table.setRowCount(max(1, len(self._smart_groups)))
         if not self._smart_groups:
             self._set_empty_smart_group_row()
+            self._refresh_smart_group_details()
             return
         for row, group in enumerate(self._smart_groups):
             members = self._group_member_profiles(group)
@@ -466,6 +478,8 @@ class ServersPage(QWidget):
                 SMART_GROUP_MODE_LABELS.get(group.mode, group.mode),
                 SMART_STRATEGY_LABELS.get(group.strategy, group.strategy),
                 str(len(members)),
+                self._group_quality_label(members),
+                self._group_usage_label(group, members),
                 "Включена" if group.enabled else "Отключена",
                 self._short_timestamp(group.updated_at),
             ]
@@ -473,20 +487,23 @@ class ServersPage(QWidget):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, group.id)
                 item.setToolTip(self._smart_group_tooltip(group, members))
-                if col in (1, 2, 3, 4, 5):
+                if col in (1, 2, 3, 4, 5, 6, 7):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if not group.enabled:
                     item.setForeground(QColor(150, 150, 150))
                 elif self._active_id and self._active_id in group.profile_ids:
                     item.setForeground(QColor(130, 200, 255))
-                elif col == 3:
+                elif col in (3, 4):
                     item.setForeground(QColor("#85E89D"))
+                elif col == 5:
+                    item.setForeground(QColor("#8EC5FF"))
                 self.smart_groups_table.setItem(row, col, item)
         self.smart_groups_table.resizeRowsToContents()
+        self._refresh_smart_group_details()
 
     def _set_empty_smart_group_row(self) -> None:
         self.smart_groups_table.clearContents()
-        values = ["Группы еще не созданы", "—", "—", "0", "—", "—"]
+        values = ["Группы еще не созданы", "—", "—", "0", "—", "—", "—", "—"]
         for col, value in enumerate(values):
             item = QTableWidgetItem(value)
             item.setForeground(QColor(150, 150, 150))
@@ -513,6 +530,8 @@ class ServersPage(QWidget):
             f"Стратегия: {SMART_STRATEGY_LABELS.get(group.strategy, group.strategy)}",
             f"Режим: {SMART_GROUP_MODE_LABELS.get(group.mode, group.mode)}",
             f"Статус: {'включена' if group.enabled else 'отключена'}",
+            f"Качество: {self._group_quality_label(members)}",
+            f"Использование: {self._group_usage_label(group, members)}",
         ]
         if group.mode == SMART_GROUP_MODE_LOAD_BALANCE:
             lines.append(
@@ -531,12 +550,87 @@ class ServersPage(QWidget):
             lines.append(f"Группа: {group.source_group}")
         if members:
             lines.append("Серверы:")
-            for profile in members[:8]:
+            for index, profile in enumerate(members[:8]):
                 latency = f" · {profile.latency_ms} ms" if profile.latency_ms is not None else ""
-                lines.append(f"  {profile.name}{latency}")
+                lines.append(f"  {self._group_member_role(group, index, len(members))}: {profile.name}{latency}")
             if len(members) > 8:
                 lines.append(f"  еще {len(members) - 8}")
         return "\n".join(lines)
+
+    def _selected_smart_group(self) -> SmartGroup | None:
+        group_id = self._selected_smart_group_id()
+        if not group_id:
+            return None
+        return next((group for group in self._smart_groups if group.id == group_id), None)
+
+    def _refresh_smart_group_details(self) -> None:
+        if not hasattr(self, "smart_group_detail_label"):
+            return
+        group = self._selected_smart_group()
+        if not group:
+            self.smart_group_detail_label.setText("Выберите группу, чтобы увидеть состав и статистику.")
+            return
+        members = self._group_member_profiles(group)
+        mode = SMART_GROUP_MODE_LABELS.get(group.mode, group.mode)
+        member_preview = " -> ".join(
+            f"{self._group_member_role(group, index, len(members))}: {profile.name}"
+            for index, profile in enumerate(members[:5])
+        )
+        if len(members) > 5:
+            member_preview += f" -> еще {len(members) - 5}"
+        if not member_preview:
+            member_preview = "состав пуст или серверы удалены"
+        self.smart_group_detail_label.setText(
+            f"{group.name} · {mode} · {len(members)} серверов · "
+            f"качество {self._group_quality_label(members)} · "
+            f"использование {self._group_usage_label(group, members)}\n{member_preview}"
+        )
+
+    def _group_quality_label(self, members: list[VlessProfile]) -> str:
+        stats = [self._quality_stats.get(profile.id) for profile in members]
+        stats = [item for item in stats if item is not None]
+        if not stats:
+            known_latency = [profile.latency_ms for profile in members if profile.latency_ms is not None]
+            if not known_latency:
+                return "—"
+            return f"пинг {int(sum(known_latency) / len(known_latency))} ms"
+        recent = int(sum(item.recent_success_rate for item in stats) / len(stats) * 100)
+        latency_values = [
+            item.recent_average_latency_ms or int(item.latency_ewma_ms or 0) or item.last_latency_ms
+            for item in stats
+        ]
+        latency_values = [value for value in latency_values if value]
+        latency = f" · {int(sum(latency_values) / len(latency_values))} ms" if latency_values else ""
+        failures = sum(item.consecutive_failures for item in stats)
+        failure_text = f" · {failures} подряд" if failures else ""
+        return f"{recent}%{latency}{failure_text}"
+
+    def _group_usage_label(self, group: SmartGroup, members: list[VlessProfile]) -> str:
+        if group.usage_connection_count:
+            total_bytes = group.usage_total_download_bytes + group.usage_total_upload_bytes
+            return f"{group.usage_connection_count} запусков · {self._bytes_label(total_bytes)}"
+        member_stats = [self._quality_stats.get(profile.id) for profile in members]
+        connection_count = sum(stats.connection_count for stats in member_stats if stats)
+        total_bytes = sum(
+            stats.total_download_bytes + stats.total_upload_bytes
+            for stats in member_stats
+            if stats
+        )
+        if connection_count:
+            return f"{connection_count} запусков участников · {self._bytes_label(total_bytes)}"
+        return "—"
+
+    @staticmethod
+    def _group_member_role(group: SmartGroup, index: int, count: int) -> str:
+        if group.mode == SMART_GROUP_MODE_MULTI_HOP:
+            if index == 0:
+                return "Hop 1"
+            if index == count - 1:
+                return "Exit"
+            return f"Hop {index + 1}"
+        if group.mode == SMART_GROUP_MODE_LOAD_BALANCE:
+            return f"LB {index + 1}"
+        return f"#{index + 1}"
 
     @staticmethod
     def _short_timestamp(value: str | None) -> str:
@@ -766,8 +860,8 @@ class ServersPage(QWidget):
         lines = [
             "",
             "Качество:",
-            f"  Success rate: {int(stats.success_rate * 100)}%",
-            f"  Recent success: {int(stats.recent_success_rate * 100)}%",
+            f"  Общая успешность: {int(stats.success_rate * 100)}%",
+            f"  Недавняя успешность: {int(stats.recent_success_rate * 100)}%",
             f"  Успехов/ошибок: {stats.success_count}/{stats.failure_count}",
             f"  Ошибок подряд: {stats.consecutive_failures}",
             f"  Использование: {stats.connection_count} запусков",
@@ -777,7 +871,7 @@ class ServersPage(QWidget):
         if stats.latency_ewma_ms is not None:
             lines.append(f"  EWMA latency: {int(stats.latency_ewma_ms)} ms")
         if stats.recent_average_latency_ms is not None:
-            lines.append(f"  Recent avg latency: {stats.recent_average_latency_ms} ms")
+            lines.append(f"  Средняя недавняя задержка: {stats.recent_average_latency_ms} ms")
         if stats.last_checked_at:
             lines.append(f"  Последняя проверка: {stats.last_checked_at}")
         if stats.history:

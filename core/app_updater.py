@@ -223,6 +223,8 @@ def download_update_asset(
                 for chunk in response.iter_content(chunk_size=1024 * 256):
                     if chunk:
                         file.write(chunk)
+        if _file_size(temp_target) <= 0:
+            raise AppUpdateError("Скачанный файл обновления пустой")
         if verify_checksum and update.checksum_asset:
             _verify_sha256_if_available(update.checksum_asset, target.name, temp_target)
         temp_target.replace(target)
@@ -263,6 +265,8 @@ def prepare_in_place_update(
         raise AppUpdateError("Скачанный файл обновления не найден")
     if downloaded.suffix.lower() != ".exe":
         raise AppUpdateError("Автоматическая замена поддерживает только .exe asset")
+    if _file_size(downloaded) <= 0:
+        raise AppUpdateError("Скачанный файл обновления пустой")
     if downloaded == executable:
         raise AppUpdateError("Файл обновления совпадает с текущим EXE")
 
@@ -294,6 +298,10 @@ def prepare_in_place_update(
 
 
 def launch_in_place_update(plan: PreparedInPlaceUpdate) -> None:
+    if not plan.script_path.exists():
+        raise AppUpdateError("Скрипт замены приложения не найден")
+    if _file_size(plan.script_path) <= 0:
+        raise AppUpdateError("Скрипт замены приложения пустой")
     flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
     try:
         subprocess.Popen(
@@ -400,7 +408,7 @@ def _verify_sha256_if_available(checksum_asset: AppReleaseAsset, target_name: st
 
     expected = _extract_sha256(response.text, target_name)
     if not expected:
-        return
+        raise AppUpdateError("Checksum release не содержит SHA256 для файла обновления")
     digest = hashlib.sha256(target_path.read_bytes()).hexdigest().lower()
     if digest != expected.lower():
         raise AppUpdateError("SHA256 скачанного обновления не совпадает с checksum release")
@@ -547,3 +555,10 @@ def _remove_partial(path: Path) -> None:
         return
     except OSError:
         return
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0

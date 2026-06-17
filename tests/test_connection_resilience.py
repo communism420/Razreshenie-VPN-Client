@@ -4,11 +4,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
-from core.connection_service import ConnectionService
+from core.connection_service import ConnectionService, ConnectionStartResult
 from core.connectivity import ConnectivityCheckResult, ConnectivityProbeResult
-from core.resilience_service import HEALTH_STATUS_RECOVER, RECOVERY_ACTION_FAILOVER, ResilienceService
+from core.resilience_service import (
+    HEALTH_STATUS_RECOVER,
+    RECOVERY_ACTION_FAILOVER,
+    RECOVERY_ACTION_RESTART_GROUP,
+    ResilienceService,
+)
 from core.smart_connect import SmartConnectManager
-from models.connection import SMART_GROUP_MODE_LOAD_BALANCE, SmartGroup
+from models.connection import SMART_GROUP_MODE_FAILOVER, SMART_GROUP_MODE_LOAD_BALANCE, SmartGroup
 from models.profile import VlessProfile
 from models.rules import SplitRules
 from models.settings import AppSettings
@@ -33,15 +38,16 @@ class FakeLatencyScanner:
 
 
 class FakeSingBox:
-    def __init__(self, *, fail_start: bool = False) -> None:
+    def __init__(self, *, fail_start: bool = False, fail_start_ids: set[str] | None = None) -> None:
         self.fail_start = fail_start
+        self.fail_start_ids = set(fail_start_ids or set())
         self.start_calls: list[str] = []
         self.start_group_calls: list[tuple[str, list[str]]] = []
         self.stop_calls = 0
 
     def start(self, profile, settings, split_rules) -> None:
         self.start_calls.append(profile.id)
-        if self.fail_start:
+        if self.fail_start or profile.id in self.fail_start_ids:
             raise RuntimeError("start failed")
 
     def start_group(self, group, profiles_by_id, settings, split_rules) -> None:
@@ -173,6 +179,29 @@ class ConnectionServiceTests(unittest.TestCase):
         self.assertEqual(smart_connect.quality_stats["b"].success_count, 1)
         self.assertEqual(saved_stats, ["stats"])
 
+    def test_connection_start_result_classifies_failover_and_advanced_group(self) -> None:
+        selected = profile("a")
+
+        direct = ConnectionStartResult(anchor_profile=selected, selected_profile=selected)
+        failover_group = ConnectionStartResult(
+            anchor_profile=selected,
+            selected_profile=selected,
+            group_id="failover",
+            group_mode=SMART_GROUP_MODE_FAILOVER,
+        )
+        advanced_group = ConnectionStartResult(
+            anchor_profile=selected,
+            selected_profile=selected,
+            group_id="advanced",
+            group_mode=SMART_GROUP_MODE_LOAD_BALANCE,
+        )
+
+        self.assertTrue(direct.starts_failover_session)
+        self.assertTrue(failover_group.starts_failover_session)
+        self.assertFalse(failover_group.is_advanced_group)
+        self.assertFalse(advanced_group.starts_failover_session)
+        self.assertTrue(advanced_group.is_advanced_group)
+
 
 class ResilienceServiceTests(unittest.TestCase):
     def test_health_failure_reaches_threshold_and_plans_failover(self) -> None:
@@ -223,6 +252,209 @@ class ResilienceServiceTests(unittest.TestCase):
         self.assertFalse(second.allowed)
         self.assertIn("лимит", second.message)
 
+    def test_connection_start_applies_failover_session_policy(self) -> None:
+        primary = profile("a")
+        backup = profile("b")
+        resilience = ResilienceService(
+            connection_service=connection_service(),
+            logger=test_logger("tests.resilience"),
+            scan_limit=4,
+        )
+
+        resilience.apply_connection_start(ConnectionStartResult(anchor_profile=primary, selected_profile=primary))
+        self.assertEqual(resilience.failover_anchor_profile_id, "a")
+
+        resilience.apply_connection_start(
+            ConnectionStartResult(
+                anchor_profile=primary,
+                selected_profile=backup,
+                group_id="failover",
+                group_mode=SMART_GROUP_MODE_FAILOVER,
+            )
+        )
+        self.assertEqual(resilience.failover_anchor_profile_id, "a")
+
+        resilience.apply_connection_start(
+            ConnectionStartResult(
+                anchor_profile=primary,
+                selected_profile=backup,
+                group_id="advanced",
+                group_mode=SMART_GROUP_MODE_LOAD_BALANCE,
+            )
+        )
+        self.assertIsNone(resilience.failover_anchor_profile_id)
+
+    def test_run_failover_attempt_skips_failed_candidates_and_records_success(self) -> None:
+        primary = profile("a", 80)
+        first_backup = profile("b", 40)
+        second_backup = profile("c", 60)
+        singbox = FakeSingBox(fail_start_ids={"b"})
+        smart_connect = SmartConnectManager()
+        service = connection_service(
+            singbox=singbox,
+            smart_connect=smart_connect,
+            scanner=FakeLatencyScanner({"b": 40, "c": 60}),
+        )
+        resilience = ResilienceService(connection_service=service, logger=test_logger("tests.resilience"), scan_limit=4)
+        saved_stats = []
+        saved_profiles = []
+        recorded_latency = {}
+
+        started = resilience.begin_failover_after_drop(
+            primary,
+            busy=False,
+            closing=False,
+            save_quality_stats=lambda: saved_stats.append("stats"),
+        )
+        self.assertFalse(started)
+        resilience.begin_failover_session(primary)
+        self.assertTrue(
+            resilience.begin_failover_after_drop(
+                primary,
+                busy=False,
+                closing=False,
+                save_quality_stats=lambda: saved_stats.append("stats"),
+            )
+        )
+
+        def record_latency(profile_id: str, latency_ms: int | None, checked_at: str) -> None:
+            recorded_latency[profile_id] = latency_ms
+            smart_connect.record_latency(profile_id, latency_ms, checked_at=checked_at)
+
+        result = resilience.run_failover_attempt(
+            primary,
+            profiles=[primary, first_backup, second_backup],
+            settings=AppSettings(),
+            split_rules=SplitRules(),
+            profile_lookup=lambda profile_id: primary if profile_id == primary.id else None,
+            record_latency=record_latency,
+            save_profiles=lambda: saved_profiles.append("profiles"),
+            save_quality_stats=lambda: saved_stats.append("stats"),
+        )
+
+        self.assertIsNotNone(result.profile)
+        self.assertEqual(result.profile.id, "c")
+        self.assertEqual(singbox.start_calls, ["b", "c"])
+        self.assertEqual(recorded_latency, {"b": 40, "c": 60})
+        self.assertEqual(saved_profiles, ["profiles"])
+        self.assertIn("a", resilience.failover_failed_ids)
+        self.assertIn("b", resilience.failover_failed_ids)
+        self.assertEqual(smart_connect.quality_stats["b"].failure_count, 1)
+        self.assertEqual(smart_connect.quality_stats["c"].success_count, 2)
+        self.assertEqual(len(saved_stats), 4)
+
+    def test_advanced_group_health_recovery_restarts_group(self) -> None:
+        primary = profile("a", 80)
+        backup = profile("b", 120)
+        group = SmartGroup(
+            id="advanced",
+            name="balanced",
+            mode=SMART_GROUP_MODE_LOAD_BALANCE,
+            profile_ids=["a", "b"],
+        )
+        resilience = ResilienceService(
+            connection_service=connection_service(),
+            logger=test_logger("tests.resilience"),
+            scan_limit=4,
+        )
+
+        plan = resilience.plan_health_recovery(
+            primary,
+            "timeout",
+            settings=AppSettings(),
+            profiles=[primary, backup],
+            profile_lookup=lambda profile_id: primary if profile_id == primary.id else None,
+            busy=False,
+            closing=False,
+            active_group=group,
+        )
+
+        self.assertEqual(plan.action, RECOVERY_ACTION_RESTART_GROUP)
+        self.assertEqual(plan.group_id, "advanced")
+
+    def test_advanced_group_health_recovery_is_throttled(self) -> None:
+        primary = profile("a", 80)
+        backup = profile("b", 120)
+        group = SmartGroup(
+            id="advanced",
+            name="balanced",
+            mode=SMART_GROUP_MODE_LOAD_BALANCE,
+            profile_ids=["a", "b"],
+        )
+        resilience = ResilienceService(
+            connection_service=connection_service(),
+            logger=test_logger("tests.resilience"),
+            scan_limit=4,
+        )
+        settings = AppSettings.from_dict({"self_healing_cooldown_seconds": 30})
+
+        with patch("core.resilience_service.time.time", side_effect=[1000, 1002, 1005]):
+            first = resilience.plan_health_recovery(
+                primary,
+                "timeout",
+                settings=settings,
+                profiles=[primary, backup],
+                profile_lookup=lambda profile_id: primary if profile_id == primary.id else None,
+                busy=False,
+                closing=False,
+                active_group=group,
+            )
+            second = resilience.plan_health_recovery(
+                primary,
+                "timeout again",
+                settings=settings,
+                profiles=[primary, backup],
+                profile_lookup=lambda profile_id: primary if profile_id == primary.id else None,
+                busy=False,
+                closing=False,
+                active_group=group,
+            )
+
+        self.assertEqual(first.action, RECOVERY_ACTION_RESTART_GROUP)
+        self.assertEqual(second.action, "none")
+        self.assertIn("паузе", second.reason)
+
+    def test_advanced_group_recovery_cooldown_survives_restart_until_health_ok(self) -> None:
+        primary = profile("a", 80)
+        backup = profile("b", 120)
+        group = SmartGroup(
+            id="advanced",
+            name="balanced",
+            mode=SMART_GROUP_MODE_LOAD_BALANCE,
+            profile_ids=["a", "b"],
+        )
+        resilience = ResilienceService(
+            connection_service=connection_service(),
+            logger=test_logger("tests.resilience"),
+            scan_limit=4,
+        )
+        settings = AppSettings.from_dict({"self_healing_cooldown_seconds": 30})
+
+        with patch("core.resilience_service.time.time", side_effect=[1000, 1002, 1005]):
+            resilience.plan_health_recovery(
+                primary,
+                "timeout",
+                settings=settings,
+                profiles=[primary, backup],
+                profile_lookup=lambda profile_id: primary if profile_id == primary.id else None,
+                busy=False,
+                closing=False,
+                active_group=group,
+            )
+            resilience.on_connected()
+            second = resilience.plan_health_recovery(
+                primary,
+                "timeout again",
+                settings=settings,
+                profiles=[primary, backup],
+                profile_lookup=lambda profile_id: primary if profile_id == primary.id else None,
+                busy=False,
+                closing=False,
+                active_group=group,
+            )
+
+        self.assertEqual(second.action, "none")
+
     def test_manual_disconnect_does_not_report_core_stop(self) -> None:
         resilience = ResilienceService(
             connection_service=connection_service(),
@@ -238,6 +470,49 @@ class ResilienceServiceTests(unittest.TestCase):
 
         resilience.mark_core_stopped()
         self.assertFalse(resilience.last_connection_running)
+
+    def test_health_reconnect_restarts_current_profile_and_records_success(self) -> None:
+        active = profile("a")
+        singbox = FakeSingBox()
+        smart_connect = SmartConnectManager()
+        resilience = ResilienceService(
+            connection_service=connection_service(singbox=singbox, smart_connect=smart_connect),
+            logger=test_logger("tests.resilience"),
+            scan_limit=4,
+        )
+        saved = []
+
+        result = resilience.run_health_reconnect(
+            active,
+            settings=AppSettings(),
+            split_rules=SplitRules(),
+            save_quality_stats=lambda: saved.append("stats"),
+        )
+
+        self.assertIsNotNone(result.profile)
+        self.assertEqual(result.profile.id, "a")
+        self.assertEqual(singbox.stop_calls, 1)
+        self.assertEqual(singbox.start_calls, ["a"])
+        self.assertEqual(smart_connect.quality_stats["a"].success_count, 1)
+        self.assertEqual(saved, ["stats"])
+
+    def test_self_healing_cooldown_allows_new_attempt_after_pause(self) -> None:
+        resilience = ResilienceService(
+            connection_service=connection_service(),
+            logger=test_logger("tests.resilience"),
+            scan_limit=4,
+        )
+        settings = AppSettings.from_dict({"self_healing_max_attempts": 1, "self_healing_cooldown_seconds": 30})
+
+        with patch("core.resilience_service.time.time", side_effect=[1000, 1001, 1035]):
+            first = resilience.register_self_healing_attempt(settings, "first")
+            limited = resilience.register_self_healing_attempt(settings, "second")
+            after_cooldown = resilience.register_self_healing_attempt(settings, "third")
+
+        self.assertTrue(first.allowed)
+        self.assertFalse(limited.allowed)
+        self.assertTrue(after_cooldown.allowed)
+        self.assertEqual(resilience.self_healing_attempts, 1)
 
 
 if __name__ == "__main__":

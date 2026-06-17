@@ -56,6 +56,60 @@ class RouteBuilderTests(unittest.TestCase):
         self.assertTrue(any(rule.get("rule_set") == ["local-ru"] for rule in route["rules"]))
         self.assertTrue(any(rule.get("rule_set") == ["remote-ads"] for rule in route["rules"]))
 
+    def test_complex_selector_with_inline_srs_and_process_rules_is_emitted(self) -> None:
+        rules = SplitRules(
+            enabled=True,
+            rule_set_resources=[
+                RouteRuleSetResource(
+                    name="inline",
+                    type="inline",
+                    tag="inline-ru",
+                    rules=[{"domain_suffix": ["ru"]}],
+                ),
+            ],
+            rule_sets=[
+                RoutingRuleSet(
+                    name="complex",
+                    outbound=ROUTE_OUTBOUND_DIRECT,
+                    priority=10,
+                    domains=["EXAMPLE.com", "https://api.example.com/path"],
+                    domain_suffix=[".ru"],
+                    domain_keyword=["cdn", "cdn"],
+                    domain_regex=[r".*\\.internal$"],
+                    geosite=["category-ads-all"],
+                    geoip=["private"],
+                    ip_cidr=["10.0.0.0/8"],
+                    process_name=[r"C:\Tools\App.exe --flag", "browser.exe"],
+                    process_path=[r"C:\Program Files\App\app.exe --flag"],
+                    process_path_regex=[r".*\\app\\.exe$"],
+                    rule_set_tags=["inline-ru"],
+                    rule_set_ip_cidr_match_source=True,
+                )
+            ],
+        )
+
+        route = RouteBuilder().build(rules)
+        selector = next(rule for rule in route["rules"] if rule.get("rule_set") == ["inline-ru"])
+
+        self.assertEqual(route["rule_set"][0], {"type": "inline", "tag": "inline-ru", "rules": [{"domain_suffix": ["ru"]}]})
+        self.assertEqual(selector["domain"], ["api.example.com", "example.com"])
+        self.assertEqual(selector["domain_suffix"], ["example.com", "ru"])
+        self.assertEqual(selector["domain_keyword"], ["cdn"])
+        self.assertEqual(selector["domain_regex"], [r".*\\.internal$"])
+        self.assertEqual(selector["geosite"], ["category-ads-all"])
+        self.assertEqual(selector["geoip"], ["private"])
+        self.assertEqual(selector["ip_cidr"], ["10.0.0.0/8"])
+        self.assertEqual(selector["process_name"], ["App.exe", "browser.exe"])
+        self.assertEqual(selector["process_path"], [r"C:\Program Files\App\app.exe"])
+        self.assertEqual(selector["process_path_regex"], [r".*\\app\\.exe$"])
+        self.assertTrue(selector["rule_set_ip_cidr_match_source"])
+
+    def test_inline_srs_resource_without_rules_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigBuildError, "пуст"):
+            RouteBuilder()._build_route_rule_set(
+                RouteRuleSetResource(name="empty inline", type="inline", tag="empty", rules=[])
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

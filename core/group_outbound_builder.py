@@ -82,7 +82,8 @@ class GroupOutboundBuilder:
         for index, profile in enumerate(members, start=1):
             is_exit = index == len(members)
             tag = "proxy" if is_exit else f"hop-{index}"
-            outbound = self._build_profile_outbound(profile, tag)
+            role = f"Multi-hop {'exit' if is_exit else 'hop'} {index}"
+            outbound = self._build_profile_outbound(profile, tag, role=role)
             if previous_tag:
                 outbound["detour"] = previous_tag
             outbounds.append(outbound)
@@ -109,15 +110,17 @@ class GroupOutboundBuilder:
         tags: list[str] = []
         for index, profile in enumerate(members, start=1):
             tag = f"lb-{index}"
-            outbounds.append(self._build_profile_outbound(profile, tag))
+            outbounds.append(self._build_profile_outbound(profile, tag, role=f"Load Balance member {index}"))
             tags.append(tag)
 
         interval = str(group.load_balance_interval or SMART_GROUP_LOAD_BALANCE_INTERVAL_DEFAULT).strip()
         if not interval:
             interval = SMART_GROUP_LOAD_BALANCE_INTERVAL_DEFAULT
-        tolerance = max(
-            0,
-            int(group.load_balance_tolerance_ms or SMART_GROUP_LOAD_BALANCE_TOLERANCE_DEFAULT_MS),
+        if not any(char.isdigit() for char in interval):
+            interval = SMART_GROUP_LOAD_BALANCE_INTERVAL_DEFAULT
+        tolerance = self._safe_non_negative_int(
+            group.load_balance_tolerance_ms,
+            default=SMART_GROUP_LOAD_BALANCE_TOLERANCE_DEFAULT_MS,
         )
         outbounds.append(
             {
@@ -137,18 +140,41 @@ class GroupOutboundBuilder:
             mode=SMART_GROUP_MODE_LOAD_BALANCE,
         )
 
-    def _build_profile_outbound(self, profile: ServerProfile, tag: str) -> dict[str, object]:
+    def _build_profile_outbound(self, profile: ServerProfile, tag: str, *, role: str) -> dict[str, object]:
         try:
             return self.outbound_builder.build(profile, tag=tag)
         except OutboundBuildError as exc:
-            raise GroupOutboundBuildError(str(exc)) from exc
+            profile_name = str(profile.name or profile.id or "сервер").strip()
+            raise GroupOutboundBuildError(f"{role} '{profile_name}': {exc}") from exc
 
     @staticmethod
     def _member_profiles(
         group: SmartGroup,
         profiles_by_id: Mapping[str, ServerProfile],
     ) -> list[ServerProfile]:
-        members = [profiles_by_id[profile_id] for profile_id in group.profile_ids if profile_id in profiles_by_id]
+        members: list[ServerProfile] = []
+        missing_ids: list[str] = []
+        for profile_id in group.profile_ids:
+            profile = profiles_by_id.get(profile_id)
+            if profile is None:
+                missing_ids.append(str(profile_id))
+                continue
+            members.append(profile)
+        if missing_ids:
+            sample = ", ".join(missing_ids[:3])
+            extra = f" и ещё {len(missing_ids) - 3}" if len(missing_ids) > 3 else ""
+            raise GroupOutboundBuildError(
+                f"Группа '{group.name}' содержит недоступные серверы: {sample}{extra}. "
+                "Обновите состав группы перед подключением."
+            )
         if not members:
             raise GroupOutboundBuildError(f"Группа '{group.name}' не содержит доступных серверов")
         return members
+
+    @staticmethod
+    def _safe_non_negative_int(value: object, *, default: int) -> int:
+        try:
+            parsed = int(value) if value not in (None, "") else int(default)
+        except (TypeError, ValueError):
+            parsed = int(default)
+        return max(0, parsed)

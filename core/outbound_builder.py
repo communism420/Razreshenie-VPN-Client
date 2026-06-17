@@ -36,6 +36,8 @@ SUPPORTED_OUTBOUND_PROTOCOLS = {
     "shadowsocks",
     "wireguard",
 }
+REALITY_PUBLIC_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
+REALITY_SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]*$")
 
 
 def _truthy(value: str | None) -> bool:
@@ -308,10 +310,12 @@ class OutboundBuilder:
             public_key = self._param(profile, "pbk", "publicKey", "public_key")
             if not public_key:
                 raise OutboundBuildError(f"{profile.protocol.upper()} Reality требует параметр pbk/publicKey")
+            public_key = self._validate_reality_public_key(public_key, profile.protocol)
             reality: dict[str, Any] = {"enabled": True, "public_key": public_key}
             short_id = self._param(profile, "sid", "shortId", "short_id")
             spider_x = self._param(profile, "spx", "spiderX", "spider_x")
             if short_id:
+                short_id = self._validate_reality_short_id(short_id, profile.protocol)
                 reality["short_id"] = short_id
             if spider_x:
                 reality["spider_x"] = spider_x
@@ -404,6 +408,35 @@ class OutboundBuilder:
                 return None
             reserved.append(item)
         return reserved if len(reserved) == 3 else None
+
+    @staticmethod
+    def _validate_reality_public_key(value: str, protocol: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise OutboundBuildError(f"{protocol.upper()} Reality требует параметр pbk/publicKey")
+        if (
+            len(text) < 16
+            or len(text) > 128
+            or not REALITY_PUBLIC_KEY_RE.fullmatch(text)
+            or "=" in text.rstrip("=")
+        ):
+            raise OutboundBuildError(
+                f"{protocol.upper()} Reality: некорректный pbk/publicKey. "
+                "Ожидается base64url public key без пробелов."
+            )
+        return text
+
+    @staticmethod
+    def _validate_reality_short_id(value: str, protocol: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if len(text) > 16 or len(text) % 2 != 0 or not REALITY_SHORT_ID_RE.fullmatch(text):
+            raise OutboundBuildError(
+                f"{protocol.upper()} Reality: некорректный sid/short_id. "
+                "Ожидается hex-строка чётной длины до 16 символов."
+            )
+        return text
 
     @staticmethod
     def _require_endpoint(profile: ServerProfile) -> None:

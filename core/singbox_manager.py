@@ -30,6 +30,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import requests
@@ -270,6 +271,34 @@ class SingBoxManager:
             return False, str(exc)
         output = "\n".join(part for part in (proc.stdout.strip(), proc.stderr.strip()) if part)
         return proc.returncode == 0, output or "config OK"
+
+    def check_profile_config(
+        self,
+        profile: ServerProfile,
+        settings: AppSettings,
+        split_rules: SplitRules,
+    ) -> tuple[bool, str]:
+        """Validate a profile config without replacing the active runtime config."""
+        config = self._build_config(profile, settings, split_rules)
+        return self._check_config_payload(config)
+
+    def check_group_config(
+        self,
+        group: SmartGroup,
+        profiles_by_id: dict[str, ServerProfile],
+        settings: AppSettings,
+        split_rules: SplitRules,
+    ) -> tuple[bool, str]:
+        """Validate a smart-group config without replacing the active runtime config."""
+        config = self._build_group_config(group, profiles_by_id, settings, split_rules)
+        return self._check_config_payload(config)
+
+    def _check_config_payload(self, config: dict[str, Any]) -> tuple[bool, str]:
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="config-check-", dir=str(self.config_path.parent)) as tmp_dir:
+            temp_path = Path(tmp_dir) / "sing-box-check.json"
+            write_json(temp_path, config)
+            return self.check_config(temp_path)
 
     def start(self, profile: ServerProfile, settings: AppSettings, split_rules: SplitRules) -> None:
         with self._lock:
@@ -626,17 +655,7 @@ class SingBoxManager:
                 "raw_url": profile.raw_url,
                 "params": dict(sorted(profile.params.items())),
             },
-            "settings": {
-                "mode": settings.mode,
-                "mixed_listen_host": settings.mixed_listen_host,
-                "mixed_port": int(settings.mixed_port),
-                "tun_interface_name": settings.tun_interface_name,
-                "tun_address": settings.tun_address,
-                "tun_mtu": int(settings.tun_mtu),
-                "dns_servers": list(settings.dns_servers),
-                "kill_switch": bool(settings.kill_switch),
-                "log_level": settings.log_level,
-            },
+            "settings": self._settings_fingerprint_payload(settings),
             "split_rules": split_rules.to_dict(),
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -672,21 +691,28 @@ class SingBoxManager:
                 }
                 for profile in members
             ],
-            "settings": {
-                "mode": settings.mode,
-                "mixed_listen_host": settings.mixed_listen_host,
-                "mixed_port": int(settings.mixed_port),
-                "tun_interface_name": settings.tun_interface_name,
-                "tun_address": settings.tun_address,
-                "tun_mtu": int(settings.tun_mtu),
-                "dns_servers": list(settings.dns_servers),
-                "kill_switch": bool(settings.kill_switch),
-                "log_level": settings.log_level,
-            },
+            "settings": self._settings_fingerprint_payload(settings),
             "split_rules": split_rules.to_dict(),
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _settings_fingerprint_payload(settings: AppSettings) -> dict[str, object]:
+        return {
+            "mode": settings.mode,
+            "mixed_listen_host": settings.mixed_listen_host,
+            "mixed_port": int(settings.mixed_port),
+            "tun_interface_name": settings.tun_interface_name,
+            "tun_address": settings.tun_address,
+            "tun_ipv6_address": settings.tun_ipv6_address,
+            "tun_mtu": int(settings.tun_mtu),
+            "dns_servers": list(settings.dns_servers),
+            "dns_strategy": settings.dns_strategy,
+            "enable_ipv6": bool(settings.enable_ipv6),
+            "kill_switch": bool(settings.kill_switch),
+            "log_level": settings.log_level,
+        }
 
     @staticmethod
     def _group_member_profiles(group: SmartGroup, profiles_by_id: dict[str, ServerProfile]) -> list[ServerProfile]:

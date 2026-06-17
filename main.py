@@ -119,11 +119,12 @@ def run_self_check() -> int:
         build_firewall_kill_switch_enable_script,
     )
 
+    demo_reality_public_key = "A" * 43
     samples = [
         "vless://00000000-0000-4000-8000-000000000000@example.com:443"
         "?security=reality&type=tcp&flow=xtls-rprx-vision"
-        "&sni=example.com&fp=chrome&pbk=public-key&sid=abcd#VLESS Demo",
-        "trojan://password@example.com:443?security=reality&sni=example.com&fp=chrome&pbk=public-key&sid=abcd#Trojan Demo",
+        f"&sni=example.com&fp=chrome&pbk={demo_reality_public_key}&sid=abcd#VLESS Demo",
+        f"trojan://password@example.com:443?security=reality&sni=example.com&fp=chrome&pbk={demo_reality_public_key}&sid=abcd#Trojan Demo",
         "hysteria2://password@example.com:443?sni=example.com&obfs=salamander&obfs-password=secret#HY2 Demo",
         "tuic://00000000-0000-4000-8000-000000000000:password@example.com:443?sni=example.com&congestion_control=bbr#TUIC Demo",
         "ss://2022-blake3-aes-128-gcm:password@example.com:8388#SS2022 Demo",
@@ -964,7 +965,10 @@ proxy-groups:
     assert sum(1 for result in batch_results if not result.success) == 1
     assert batch_progress[-1].current == 2
     assert batch_progress[-1].errors == 1
-    print("Self-check OK")
+    print(
+        "Self-check OK: parsers, config, routing/SRS, groups, Smart Connect, "
+        "subscriptions, updater, diagnostics"
+    )
     return 0
 
 
@@ -974,7 +978,15 @@ def main() -> int:
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
     args = parser.parse_args()
     if args.self_check:
-        return run_self_check()
+        try:
+            return run_self_check()
+        except AssertionError as exc:
+            detail = str(exc).strip() or "внутренняя проверка вернула неожиданный результат"
+            print(f"Self-check FAILED: {detail}", file=sys.stderr)
+            return 1
+        except Exception as exc:
+            print(f"Self-check ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
     if maybe_relaunch_as_admin_for_startup():
         return 0
     return run_gui()

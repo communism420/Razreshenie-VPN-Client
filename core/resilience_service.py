@@ -22,9 +22,10 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from core.connection_service import ConnectionService
+from core.connection_service import ConnectionService, ConnectionStartResult
 from core.connectivity import ConnectivityCheckResult
 from core.error_messages import format_user_error, sanitize_error_text
+from models.connection import SMART_GROUP_MODE_FAILOVER, SmartGroup, normalize_smart_group_mode
 from models.profile import VlessProfile, utc_now_iso
 from models.rules import SplitRules
 from models.settings import (
@@ -51,6 +52,7 @@ HEALTH_STATUS_RECOVER = "recover"
 RECOVERY_ACTION_NONE = "none"
 RECOVERY_ACTION_FAILOVER = "failover"
 RECOVERY_ACTION_RESTART = "restart"
+RECOVERY_ACTION_RESTART_GROUP = "restart_group"
 
 ProfileLookup = Callable[[str], VlessProfile | None]
 ProfileLatencyRecorder = Callable[[str, int | None, str], object]
@@ -78,6 +80,7 @@ class HealthCheckOutcome:
 class RecoveryPlan:
     action: str
     reason: str = ""
+    group_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +120,7 @@ class ResilienceService:
         self.self_healing_attempts = 0
         self.self_healing_last_attempt_at = 0
         self.self_healing_cooldown_until = 0
+        self.health_recovery_cooldown_until = 0
 
     def mark_manual_disconnect_requested(self) -> None:
         self.manual_disconnect_requested = True
@@ -135,6 +139,7 @@ class ResilienceService:
         self.last_connection_running = False
         self.health_check_running = False
         self.health_failure_count = 0
+        self.health_recovery_cooldown_until = 0
 
     def begin_failover_session(self, anchor_profile: VlessProfile) -> None:
         self.failover_anchor_profile_id = anchor_profile.id
@@ -146,6 +151,12 @@ class ResilienceService:
         self.failover_failed_ids.clear()
         self.failover_in_progress = False
         self.manual_disconnect_requested = False
+
+    def apply_connection_start(self, result: ConnectionStartResult) -> None:
+        if result.starts_failover_session:
+            self.begin_failover_session(result.anchor_profile)
+        else:
+            self.clear_failover_session()
 
     def should_auto_failover(self, *, busy: bool, closing: bool) -> bool:
         return bool(
@@ -303,6 +314,7 @@ class ResilienceService:
             else:
                 self.smart_connect.record_success(profile.id, checked_at=timestamp)
             save_quality_stats()
+            self.health_recovery_cooldown_until = 0
             self.logger.debug("Health monitor OK: %s", result.summary)
             return HealthCheckOutcome(
                 HEALTH_STATUS_OK,
@@ -342,10 +354,16 @@ class ResilienceService:
         profile_lookup: ProfileLookup,
         busy: bool,
         closing: bool,
+        active_group: SmartGroup | None = None,
     ) -> RecoveryPlan:
         if self.manual_disconnect_requested or busy or self.failover_in_progress:
             return RecoveryPlan(RECOVERY_ACTION_NONE, reason)
         self.health_failure_count = 0
+        if active_group and normalize_smart_group_mode(active_group.mode) != SMART_GROUP_MODE_FAILOVER:
+            decision = self.register_health_recovery_attempt(settings, reason)
+            if not decision.allowed:
+                return RecoveryPlan(RECOVERY_ACTION_NONE, decision.message, group_id=active_group.id)
+            return RecoveryPlan(RECOVERY_ACTION_RESTART_GROUP, sanitize_error_text(reason), group_id=active_group.id)
         # Health recovery сначала ищет живого кандидата в failover-группе.
         # Если группы нет или кандидатов не осталось, безопаснее рестартовать текущий профиль.
         anchor_profile = profile_lookup(self.failover_anchor_profile_id or "") or profile
@@ -437,6 +455,23 @@ class ResilienceService:
             self.self_healing_attempts,
             max_attempts,
             reason,
+        )
+        return SelfHealingDecision(True)
+
+    def register_health_recovery_attempt(self, settings: AppSettings, reason: str) -> SelfHealingDecision:
+        """Throttle repeated health-monitor recovery restarts for advanced groups."""
+        now = int(time.time())
+        if self.health_recovery_cooldown_until and now < self.health_recovery_cooldown_until:
+            remaining = self.health_recovery_cooldown_until - now
+            message = f"Health monitor: recovery на паузе ещё {remaining} сек.: {sanitize_error_text(reason)}"
+            self.logger.warning(message)
+            return SelfHealingDecision(False, message)
+        cooldown = self.self_healing_cooldown_seconds(settings)
+        self.health_recovery_cooldown_until = now + cooldown
+        self.logger.warning(
+            "Health monitor recovery allowed; cooldown=%ss. Reason: %s",
+            cooldown,
+            sanitize_error_text(reason),
         )
         return SelfHealingDecision(True)
 

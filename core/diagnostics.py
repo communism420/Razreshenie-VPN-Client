@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -190,6 +191,21 @@ def build_diagnostics_archive(
             "state/smart-groups.redacted.json",
             redact_diagnostics_data(_to_serializable(smart_groups) if smart_groups is not None else read_json(paths.smart_groups_path(), [])),
         )
+        write_json(
+            "state/stability-summary.redacted.json",
+            redact_diagnostics_data(
+                collect_stability_summary(
+                    settings=settings,
+                    profiles=profiles,
+                    subscriptions=subscriptions,
+                    split_rules=split_rules,
+                    quality_stats=quality_stats,
+                    smart_groups=smart_groups,
+                    singbox=singbox,
+                    log_lines=log_lines,
+                )
+            ),
+        )
 
         runtime_config = read_json(paths.runtime_config_path(), {}) if paths.runtime_config_path().exists() else {}
         write_json("configs/sing-box-runtime.redacted.json", redact_diagnostics_data(runtime_config))
@@ -215,6 +231,73 @@ def build_diagnostics_archive(
         write_json("manifest.json", manifest)
 
     return target
+
+
+def collect_stability_summary(
+    *,
+    settings: Any | None = None,
+    profiles: Any | None = None,
+    subscriptions: Any | None = None,
+    split_rules: Any | None = None,
+    quality_stats: Any | None = None,
+    smart_groups: Any | None = None,
+    singbox: Any | None = None,
+    log_lines: list[str] | None = None,
+) -> dict[str, Any]:
+    """Собирает агрегированную сводку стабильности без адресов, ключей и имен серверов."""
+    settings_payload = _to_serializable(settings) if settings is not None else read_json(paths.settings_path(), {})
+    profiles_payload = _as_list(_to_serializable(profiles) if profiles is not None else read_json(paths.profiles_path(), []))
+    subscriptions_payload = _as_list(
+        _to_serializable(subscriptions) if subscriptions is not None else read_json(paths.subscriptions_path(), [])
+    )
+    rules_payload = _to_serializable(split_rules) if split_rules is not None else read_json(paths.rules_path(), {})
+    quality_payload = _to_serializable(quality_stats) if quality_stats is not None else read_json(paths.quality_stats_path(), {})
+    groups_payload = _as_list(
+        _to_serializable(smart_groups) if smart_groups is not None else read_json(paths.smart_groups_path(), [])
+    )
+
+    protocol_counts = Counter(
+        str(profile.get("protocol") or "vless").strip().lower() or "vless"
+        for profile in profiles_payload
+        if isinstance(profile, dict)
+    )
+    group_mode_counts = Counter(
+        str(group.get("mode") or "failover").strip().lower() or "failover"
+        for group in groups_payload
+        if isinstance(group, dict)
+    )
+    quality_items = _quality_items(quality_payload)
+    log_error_lines = _count_log_error_lines(log_lines or [])
+    summary: dict[str, Any] = {
+        "counts": {
+            "profiles_total": len(profiles_payload),
+            "profiles_by_protocol": dict(sorted(protocol_counts.items())),
+            "subscriptions_total": len(subscriptions_payload),
+            "subscriptions_enabled": sum(
+                1
+                for item in subscriptions_payload
+                if isinstance(item, dict) and _truthy_value(item.get("enabled", True))
+            ),
+            "smart_groups_total": len(groups_payload),
+            "smart_groups_by_mode": dict(sorted(group_mode_counts.items())),
+        },
+        "routing": _routing_summary(rules_payload),
+        "quality": {
+            "tracked_profiles": len(quality_items),
+            "profiles_with_failures": sum(1 for item in quality_items if _safe_int_value(item.get("failure_count")) > 0),
+            "profiles_with_consecutive_failures": sum(
+                1 for item in quality_items if _safe_int_value(item.get("consecutive_failures")) > 0
+            ),
+            "history_events": sum(len(_as_list(item.get("history"))) for item in quality_items),
+        },
+        "health": _health_settings_summary(settings_payload),
+        "runtime": _singbox_summary(singbox) if singbox is not None else {"available": paths.runtime_config_path().exists()},
+        "logs": {
+            "session_buffer_lines": len(log_lines or []),
+            "session_buffer_error_lines": log_error_lines,
+        },
+    }
+    return summary
 
 
 def collect_system_info(*, settings: Any | None = None, singbox: Any | None = None) -> dict[str, Any]:
@@ -399,6 +482,7 @@ def _singbox_summary(singbox: Any) -> dict[str, Any]:
         ("version", lambda: singbox.version()),
         ("running", lambda: bool(singbox.is_running())),
         ("connection_state", lambda: str(getattr(singbox, "connection_state", "unknown"))),
+        ("last_runtime_error", lambda: redact_diagnostics_text(str(singbox.last_runtime_error()))),
     ):
         try:
             summary[key] = getter()
@@ -410,6 +494,121 @@ def _singbox_summary(singbox: Any) -> dict[str, Any]:
     except Exception:
         summary["executable"] = None
     return summary
+
+
+def _routing_summary(rules_payload: Any) -> dict[str, Any]:
+    if not isinstance(rules_payload, dict):
+        return {}
+    rule_sets = _as_list(rules_payload.get("rule_sets"))
+    resources = _as_list(rules_payload.get("rule_set_resources"))
+    active_rule_sets = [
+        item
+        for item in rule_sets
+        if isinstance(item, dict) and _truthy_value(item.get("enabled", True)) and _rule_total_items(item) > 0
+    ]
+    active_resources = [
+        item
+        for item in resources
+        if isinstance(item, dict) and _truthy_value(item.get("enabled", True))
+    ]
+    resource_types = Counter(
+        str(item.get("type") or "local").strip().lower() or "local"
+        for item in active_resources
+        if isinstance(item, dict)
+    )
+    resource_formats = Counter(
+        str(item.get("format") or "binary").strip().lower() or "binary"
+        for item in active_resources
+        if isinstance(item, dict)
+    )
+    return {
+        "enabled": bool(rules_payload.get("enabled")),
+        "default_outbound": str(rules_payload.get("default_outbound") or ""),
+        "rule_sets_total": len(rule_sets),
+        "rule_sets_enabled": len(active_rule_sets),
+        "rule_items_total": sum(_rule_total_items(item) for item in active_rule_sets),
+        "rule_set_resources_total": len(resources),
+        "rule_set_resources_enabled": len(active_resources),
+        "rule_set_resource_types": dict(sorted(resource_types.items())),
+        "rule_set_resource_formats": dict(sorted(resource_formats.items())),
+    }
+
+
+def _health_settings_summary(settings_payload: Any) -> dict[str, Any]:
+    if not isinstance(settings_payload, dict):
+        return {}
+    keys = (
+        "mode",
+        "background_health_check_enabled",
+        "background_health_check_interval_seconds",
+        "background_health_check_failure_threshold",
+        "self_healing_enabled",
+        "self_healing_max_attempts",
+        "self_healing_cooldown_seconds",
+        "app_update_mode",
+        "enable_ipv6",
+        "dns_strategy",
+        "kill_switch",
+        "firewall_kill_switch",
+    )
+    return {key: settings_payload.get(key) for key in keys if key in settings_payload}
+
+
+def _quality_items(quality_payload: Any) -> list[dict[str, Any]]:
+    if isinstance(quality_payload, dict):
+        values = quality_payload.values()
+    else:
+        values = _as_list(quality_payload)
+    return [item for item in values if isinstance(item, dict)]
+
+
+def _rule_total_items(rule: dict[str, Any]) -> int:
+    keys = (
+        "domains",
+        "domain_suffix",
+        "domain_keyword",
+        "domain_regex",
+        "geosite",
+        "geoip",
+        "ip_cidr",
+        "process_name",
+        "process_path",
+        "process_path_regex",
+        "rule_set_tags",
+    )
+    return sum(len(_as_list(rule.get(key))) for key in keys)
+
+
+def _count_log_error_lines(lines: list[str]) -> int:
+    needles = ("error", "failed", "failover", "timeout", "traceback", "ошибка", "не удалось")
+    return sum(1 for line in lines if any(needle in str(line).lower() for needle in needles))
+
+
+def _as_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, set):
+        return list(value)
+    return []
+
+
+def _truthy_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() not in {"", "0", "false", "no", "n", "off", "disabled"}
+
+
+def _safe_int_value(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _safe_path(path: str | Path | None) -> str | None:

@@ -4,6 +4,7 @@ __pycache__/
 build/
 dist/
 exe_release/
+artifacts/
 *.spec
 data/
 portable.flag

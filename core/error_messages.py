@@ -77,6 +77,33 @@ def format_user_error(error: BaseException | str, *, context: str = "") -> UserE
             f"{prefix}Локальный proxy-порт занят",
             "Закройте приложение, которое использует этот порт, или измените порт в настройках.",
         )
+    if _looks_like_reality_error(category_hint):
+        return UserErrorMessage(
+            "reality",
+            f"{prefix}Некорректные параметры Reality",
+            _join_details(
+                "Проверьте pbk/publicKey, sid/short_id, SNI и fingerprint в параметрах сервера.",
+                _tail(text),
+            ),
+        )
+    if _looks_like_group_error(category_hint):
+        return UserErrorMessage(
+            "group",
+            f"{prefix}Не удалось собрать группу серверов",
+            _join_details(
+                "Проверьте состав группы, порядок серверов и доступность всех участников.",
+                _tail(text),
+            ),
+        )
+    if class_name == "AppUpdateError" or _looks_like_app_update_error(category_hint):
+        return UserErrorMessage(
+            "update",
+            f"{prefix}Не удалось обновить приложение",
+            _join_details(
+                "Проверьте доступ к GitHub Releases, скачанный файл и checksum обновления.",
+                _tail(text),
+            ),
+        )
     if _has_any(category_hint, "sing-box отклонил конфигурацию", "invalid config", "config"):
         return UserErrorMessage(
             "config",
@@ -87,7 +114,10 @@ def format_user_error(error: BaseException | str, *, context: str = "") -> UserE
         return UserErrorMessage(
             "tun",
             f"{prefix}Не удалось поднять TUN",
-            "Проверьте права администратора, закройте другие VPN-клиенты и попробуйте ещё раз.",
+            _join_details(
+                "Проверьте права администратора, закройте другие VPN-клиенты и попробуйте ещё раз.",
+                _tail(text),
+            ),
         )
     if _has_any(
         category_hint,
@@ -165,3 +195,58 @@ def _tail(text: str) -> str:
 
 def _has_any(text: str, *needles: str) -> bool:
     return any(needle.lower() in text for needle in needles)
+
+
+def _join_details(*parts: str) -> str:
+    seen: set[str] = set()
+    result: list[str] = []
+    for part in parts:
+        text = sanitize_error_text(part)
+        if text and text not in seen:
+            result.append(text)
+            seen.add(text)
+    return " ".join(result)
+
+
+def _looks_like_reality_error(text: str) -> bool:
+    return (
+        "reality" in text
+        or "pbk/publickey" in text
+        or "pbk/public_key" in text
+        or " pbk" in text
+        or "public key" in text
+        or "publickey" in text
+        or "short_id" in text
+        or "short id" in text
+        or "shortid" in text
+        or "sid/short_id" in text
+    )
+
+
+def _looks_like_group_error(text: str) -> bool:
+    return _has_any(
+        text,
+        "multi-hop",
+        "multi_hop",
+        "load balance",
+        "load_balance",
+        "group outbound",
+        "group-конфигурац",
+        "цепочк",
+    )
+
+
+def _looks_like_app_update_error(text: str) -> bool:
+    return _has_any(
+        text,
+        "обновление приложения",
+        "обновления приложения",
+        "github releases",
+        "github release",
+        "checksum обновления",
+        "checksum release",
+        "скачанный файл обновления",
+        "файл обновления",
+        "замену приложения",
+        "sha256 скачанного обновления",
+    )

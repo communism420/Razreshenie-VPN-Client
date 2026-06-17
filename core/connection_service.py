@@ -59,6 +59,21 @@ class ConnectionStartResult:
         if not self.profile_ids:
             object.__setattr__(self, "profile_ids", (self.selected_profile.id,))
 
+    @property
+    def normalized_group_mode(self) -> str | None:
+        if not self.group_id:
+            return None
+        return normalize_smart_group_mode(self.group_mode)
+
+    @property
+    def is_advanced_group(self) -> bool:
+        mode = self.normalized_group_mode
+        return bool(mode and mode != SMART_GROUP_MODE_FAILOVER)
+
+    @property
+    def starts_failover_session(self) -> bool:
+        return not self.is_advanced_group
+
 
 class ConnectionService:
     """Start/stop sing-box and choose Smart Connect candidates.

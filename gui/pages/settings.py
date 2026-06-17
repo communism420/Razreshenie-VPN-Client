@@ -85,7 +85,7 @@ class SettingsPage(QWidget):
         self.mtu_card = _SpinCard(FIF.SPEED_HIGH, "TUN MTU", "MTU виртуального интерфейса", 576, 65535, network_group)
         self.ipv6_card = SwitchSettingCard(FIF.GLOBE, "IPv6", "Добавлять IPv6 TUN address, AAAA DNS и FakeIP IPv6", parent=network_group)
         self.tun_ipv6_card = _LineCard(FIF.GLOBE, "TUN IPv6", "IPv6 адрес виртуального интерфейса", network_group)
-        self.dns_strategy_card = SettingCard(FIF.GLOBE, "DNS strategy", "Как sing-box выбирает A/AAAA ответы", network_group)
+        self.dns_strategy_card = SettingCard(FIF.GLOBE, "DNS-стратегия", "Как sing-box выбирает A/AAAA ответы", network_group)
         self.dns_strategy_combo = ComboBox(self.dns_strategy_card)
         self.dns_strategy_combo.addItem("Prefer IPv4", userData=DNS_STRATEGY_PREFER_IPV4)
         self.dns_strategy_combo.addItem("Prefer IPv6", userData=DNS_STRATEGY_PREFER_IPV6)
@@ -94,10 +94,10 @@ class SettingsPage(QWidget):
         self.dns_strategy_combo.setMinimumWidth(180)
         self.dns_strategy_card.hBoxLayout.addWidget(self.dns_strategy_combo, 0, Qt.AlignmentFlag.AlignRight)
         self.dns_strategy_card.hBoxLayout.addSpacing(16)
-        self.connectivity_urls_card = _LineCard(FIF.LINK, "Health-check URL", "Через запятую", network_group)
+        self.connectivity_urls_card = _LineCard(FIF.LINK, "URL проверки связи", "Через запятую", network_group)
         self.connectivity_timeout_card = _SpinCard(
             FIF.SPEED_HIGH,
-            "Health-check timeout",
+            "Таймаут проверки",
             "Таймаут проверки, мс",
             1000,
             30000,
@@ -126,7 +126,7 @@ class SettingsPage(QWidget):
             "Opt-in fail-closed режим Windows Firewall; требует права администратора",
             parent=behavior_group,
         )
-        self.proxy_guard_card = SwitchSettingCard(FIF.LINK, "Proxy guard", "Включать системный proxy Windows", parent=behavior_group)
+        self.proxy_guard_card = SwitchSettingCard(FIF.LINK, "System proxy guard", "Включать системный proxy Windows", parent=behavior_group)
         self.auto_connect_card = SwitchSettingCard(FIF.PLAY_SOLID, "Автоподключение", "Подключаться при запуске приложения", parent=behavior_group)
         self.smart_connect_card = SwitchSettingCard(
             FIF.SPEED_HIGH,
@@ -150,10 +150,10 @@ class SettingsPage(QWidget):
         self.update_mode_card.hBoxLayout.addWidget(self.update_mode_combo, 0, Qt.AlignmentFlag.AlignRight)
         self.update_mode_card.hBoxLayout.addSpacing(16)
         self.auto_update_card = SwitchSettingCard(FIF.SYNC, "Автообновление подписок", "Обновлять подписки по расписанию", parent=behavior_group)
-        self.health_check_card = SwitchSettingCard(FIF.SYNC, "Health monitor", "Фоновая проверка текущего соединения", parent=behavior_group)
+        self.health_check_card = SwitchSettingCard(FIF.SYNC, "Мониторинг соединения", "Фоновая проверка текущего соединения", parent=behavior_group)
         self.health_interval_card = _SpinCard(
             FIF.SPEED_HIGH,
-            "Health interval",
+            "Интервал мониторинга",
             "Интервал проверки, секунд",
             BACKGROUND_HEALTH_CHECK_MIN_INTERVAL_SECONDS,
             BACKGROUND_HEALTH_CHECK_MAX_INTERVAL_SECONDS,
@@ -161,7 +161,7 @@ class SettingsPage(QWidget):
         )
         self.health_threshold_card = _SpinCard(
             FIF.CHECKBOX,
-            "Health failures",
+            "Порог ошибок",
             "Ошибок подряд до восстановления",
             BACKGROUND_HEALTH_CHECK_MIN_FAILURE_THRESHOLD,
             BACKGROUND_HEALTH_CHECK_MAX_FAILURE_THRESHOLD,
@@ -175,7 +175,7 @@ class SettingsPage(QWidget):
         )
         self.self_healing_attempts_card = _SpinCard(
             FIF.CHECKBOX,
-            "Self-healing attempts",
+            "Попытки self-healing",
             "Максимум попыток восстановления подряд",
             SELF_HEALING_MIN_MAX_ATTEMPTS,
             SELF_HEALING_MAX_MAX_ATTEMPTS,
@@ -183,7 +183,7 @@ class SettingsPage(QWidget):
         )
         self.self_healing_cooldown_card = _SpinCard(
             FIF.SPEED_HIGH,
-            "Self-healing cooldown",
+            "Пауза self-healing",
             "Пауза после исчерпания попыток, секунд",
             SELF_HEALING_MIN_COOLDOWN_SECONDS,
             SELF_HEALING_MAX_COOLDOWN_SECONDS,
@@ -215,6 +215,7 @@ class SettingsPage(QWidget):
         ):
             behavior_group.addSettingCard(card)
         root.addWidget(behavior_group)
+        self._apply_context_tooltips()
 
         self.reset_btn = PushButton(container)
         self.reset_btn.setObjectName("dangerResetButton")
@@ -248,6 +249,38 @@ class SettingsPage(QWidget):
         root.addStretch(1)
         self.reset_btn.clicked.connect(self.reset_requested)
         self._connect_auto_save_signals()
+
+    def _apply_context_tooltips(self) -> None:
+        self.dns_strategy_card.setToolTip(
+            "Prefer IPv4/IPv6 управляет предпочтением A/AAAA. IPv4 only полезен, если провайдер или сервер ломает IPv6."
+        )
+        self.connectivity_urls_card.setToolTip(
+            "Эти URL используются для ручной проверки связи, Health monitor и оценки доступности текущего подключения."
+        )
+        self.kill_switch_card.setToolTip(
+            "Strict route работает внутри TUN-конфигурации sing-box и снижает риск обхода маршрутизации."
+        )
+        self.firewall_kill_switch_card.setToolTip(
+            "Fail-closed режим через Windows Firewall. Используйте только если готовы выдавать права администратора."
+        )
+        self.proxy_guard_card.setToolTip(
+            "При Proxy-режиме включает системный proxy Windows и откатывает его при отключении."
+        )
+        self.smart_connect_card.setToolTip(
+            "При ручном подключении выбирает сервер по задержке, истории успешности и cooldown после ошибок."
+        )
+        self.health_check_card.setToolTip(
+            "Периодически проверяет текущее соединение и запускает восстановление после серии ошибок."
+        )
+        self.health_threshold_card.setToolTip(
+            "Сколько подряд неудачных health-check нужно до failover/restart. Меньше - быстрее реакция, больше - меньше ложных срабатываний."
+        )
+        self.self_healing_card.setToolTip(
+            "Если sing-box неожиданно завершился, клиент может автоматически попытаться поднять подключение заново."
+        )
+        self.update_mode_card.setToolTip(
+            "Замена текущего EXE доступна только для Windows .exe сборки; при запуске из исходников будет скачивание отдельно."
+        )
 
     def set_values(self, settings: AppSettings) -> None:
         self._loading_values = True

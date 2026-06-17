@@ -16,9 +16,16 @@
 
 VLESS требует UUID. Reality параметры берутся из URI или JSON: `sni`, `pbk`, `sid`, `fp`, `spx`. Для XTLS flow используется параметр `flow`.
 
+В 4.0.0 клиент заранее отбрасывает очевидно некорректные Reality значения:
+
+- `pbk/publicKey` должен выглядеть как base64url public key без пробелов;
+- `sid/short_id` должен быть hex-строкой чётной длины до 16 символов.
+
+Если профиль не собирается, сначала проверьте именно эти поля в ссылке или JSON.
+
 ## Trojan
 
-Trojan требует `password`. TLS включается по умолчанию, Reality поддерживается через sing-box TLS config.
+Trojan требует `password`. TLS включается по умолчанию, Reality поддерживается через sing-box TLS config и проходит ту же предварительную проверку `pbk/publicKey` и `sid/short_id`.
 
 ## VMess
 
